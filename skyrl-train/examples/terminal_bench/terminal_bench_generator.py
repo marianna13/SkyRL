@@ -642,44 +642,53 @@ class TerminalBenchGenerator(GeneratorInterface):
             f"{num_masked_trajectories} masked (excluded from baseline)"
         )
 
-        # Collect rollout_logprobs if any outputs have them (required for TIS)
+        # Collect rollout_logprobs if any outputs have them (required for TIS training)
         # For zeroed/failed trajectories, use [0.0] to match response_ids length.
         #
-        # EDGE CASE: When TIS is enabled but some trajectories have no logprobs
+        # SKIP LOGPROBS FOR EVAL: TIS is a training technique - during eval we don't
+        # compute gradients, so logprobs are unnecessary. Skipping them avoids issues
+        # where failed trials (e.g., DaytonaRateLimitError) block eval progress.
+        #
+        # EDGE CASE (training only): When TIS is enabled but some trajectories have no logprobs
         # (e.g., due to ContextLengthExceededError mid-turn where Harbor couldn't
         # collect logprobs before the error), we need to handle this gracefully:
         # - If ALL trajectories have None logprobs → return None (TIS will fail upstream)
         # - If SOME have logprobs → fill missing with zeros (TIS can still train on valid ones)
         # - Log a warning when trajectories are missing logprobs for debugging
-        has_any_logprobs = any(output.rollout_logprobs is not None for output in all_outputs)
-        missing_logprobs_count = sum(1 for output in all_outputs if output.rollout_logprobs is None)
-
         rollout_logprobs_list = None
-        if has_any_logprobs:
-            rollout_logprobs_list = []
-            for output in all_outputs:
-                if output.rollout_logprobs is not None:
-                    rollout_logprobs_list.append(output.rollout_logprobs)
-                else:
-                    # For trajectories missing logprobs, fill with zeros
-                    # This allows partial training on trajectories that have valid logprobs
-                    rollout_logprobs_list.append([0.0] * len(output.response_ids))
 
-            if missing_logprobs_count > 0:
-                logger.warning(
-                    f"TIS mode: {missing_logprobs_count}/{num_trials} trajectories missing logprobs "
-                    f"(likely due to context length errors). Filled with zeros. "
-                    f"These trajectories will have no gradient contribution from TIS."
+        if is_eval:
+            # Skip logprobs processing for eval - TIS only applies to training
+            pass
+        else:
+            has_any_logprobs = any(output.rollout_logprobs is not None for output in all_outputs)
+            missing_logprobs_count = sum(1 for output in all_outputs if output.rollout_logprobs is None)
+
+            if has_any_logprobs:
+                rollout_logprobs_list = []
+                for output in all_outputs:
+                    if output.rollout_logprobs is not None:
+                        rollout_logprobs_list.append(output.rollout_logprobs)
+                    else:
+                        # For trajectories missing logprobs, fill with zeros
+                        # This allows partial training on trajectories that have valid logprobs
+                        rollout_logprobs_list.append([0.0] * len(output.response_ids))
+
+                if missing_logprobs_count > 0:
+                    logger.warning(
+                        f"TIS mode: {missing_logprobs_count}/{num_trials} trajectories missing logprobs "
+                        f"(likely due to context length errors). Filled with zeros. "
+                        f"These trajectories will have no gradient contribution from TIS."
+                    )
+            elif missing_logprobs_count > 0:
+                # All trajectories missing logprobs - this is a problem for TIS
+                # Log error and let TIS assertion fail with better context
+                logger.error(
+                    f"TIS mode: ALL {num_trials} trajectories missing logprobs. "
+                    f"This batch cannot be used for TIS training. "
+                    f"Check if Harbor is collecting rollout_details (collect_rollout_details=true) "
+                    f"and if context length errors are preventing logprob collection."
                 )
-        elif missing_logprobs_count > 0:
-            # All trajectories missing logprobs - this is a problem for TIS
-            # Log error and let TIS assertion fail with better context
-            logger.error(
-                f"TIS mode: ALL {num_trials} trajectories missing logprobs. "
-                f"This batch cannot be used for TIS training. "
-                f"Check if Harbor is collecting rollout_details (collect_rollout_details=true) "
-                f"and if context length errors are preventing logprob collection."
-            )
 
         generator_output: GeneratorOutput = {
             "prompt_token_ids": [output.prompt_ids for output in all_outputs],

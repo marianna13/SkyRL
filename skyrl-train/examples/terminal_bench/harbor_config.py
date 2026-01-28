@@ -100,6 +100,10 @@ AGENT_SCHEMA = SectionSchema(
         # This prevents reward hacking where the model produces garbage output that the
         # parser auto-corrects, allowing the model to get rewards despite malformed responses.
         "strict_json_parser": FieldMapping("strict_json_parser", field_type="kwargs", default=False),
+        # Episode logging control
+        # When false, disables creation of episode-* folders with debug.json, prompt.txt, response.txt
+        # This reduces disk I/O for RL training where SkyRL uses TrialResult directly
+        "enable_episode_logging": FieldMapping("enable_episode_logging", field_type="kwargs", default=True),
     }
 )
 
