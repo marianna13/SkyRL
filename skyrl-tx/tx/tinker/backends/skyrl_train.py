@@ -16,6 +16,7 @@ from transformers import AutoTokenizer
 from tx.tinker import types
 from tx.tinker.backends.backend import AbstractBackend
 from tx.utils.log import logger
+import traceback
 
 try:  # Optional dependency: keep other backends importable without ray/skyrl-train.
     import ray
@@ -31,7 +32,7 @@ try:  # Optional dependency: keep other backends importable without ray/skyrl-tr
     from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 
     SKYRL_TRAIN_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only in non-ray installs
+except Exception as e:  # pragma: no cover - exercised only in non-ray installs
     ray = None
     placement_group = None
     TrainingInputBatch = Any
@@ -44,6 +45,8 @@ except ImportError:  # pragma: no cover - exercised only in non-ray installs
     create_ray_wrapped_inference_engines_from_config = None
     InferenceEngineClient = Any
     SKYRL_TRAIN_AVAILABLE = False
+    print("SkyRL-Train backend not available. Ray and skyrl-train dependencies are required.", flush=True)
+    traceback.print_exc()
 
 
 class SkyRLTrainBackendConfig(BaseModel, extra="forbid"):
@@ -52,7 +55,22 @@ class SkyRLTrainBackendConfig(BaseModel, extra="forbid"):
     Currently uses default config from skyrl-train.
     """
 
-    pass
+    num_inference_engines: int = 1
+    advantage_estimator: str = "gae"
+    use_kl_loss: bool = False
+    colocate_all: bool = True
+    strategy: str = "fsdp2"
+    policy_num_nodes: int = 1
+    ref_num_nodes: int = 0
+    policy_num_gpus_per_node: int = 4
+    ref_num_gpus_per_node: int = 0
+    weight_sync_backend: str = "nccl"
+    enable_http_endpoint: bool = False
+    gpu_memory_utilization: float = 0.95
+    http_endpoint_host: str = "127.0.0.1"
+    http_endpoint_port: int = 8000
+
+
 
 
 def _build_config(
@@ -73,6 +91,33 @@ def _build_config(
     # Disable scheduler - Tinker manages learning rate externally via set_lr()
     cfg.trainer.policy.optimizer_config.scheduler = "constant"
     cfg.trainer.policy.optimizer_config.num_warmup_steps = 0
+
+
+    #  trainer.algorithm.advantage_estimator="grpo" \
+    # trainer.algorithm.use_kl_loss=true \
+    # trainer.placement.colocate_all=false \
+    # trainer.strategy=fsdp2 \
+    # trainer.policy.model.path=${MODEL_PATH} \
+    # trainer.placement.policy_num_nodes=$POLICY_NUM_NODES \
+    # trainer.placement.ref_num_nodes=$REF_NUM_NODES \
+    # trainer.placement.policy_num_gpus_per_node=4 \
+    # trainer.placement.ref_num_gpus_per_node=4 \
+    
+
+    cfg.trainer.algorithm.advantage_estimator = config.advantage_estimator
+    cfg.trainer.algorithm.use_kl_loss = config.use_kl_loss
+    cfg.trainer.placement.colocate_all = config.colocate_all
+    cfg.trainer.strategy = config.strategy
+    cfg.trainer.placement.policy_num_nodes = config.policy_num_nodes
+    cfg.trainer.placement.ref_num_nodes = config.ref_num_nodes
+    cfg.trainer.placement.policy_num_gpus_per_node = config.policy_num_gpus_per_node
+    cfg.trainer.placement.ref_num_gpus_per_node = config.ref_num_gpus_per_node
+    cfg.generator.num_inference_engines = config.num_inference_engines
+    cfg.generator.weight_sync_backend = config.weight_sync_backend
+    cfg.generator.enable_http_endpoint = config.enable_http_endpoint
+    cfg.generator.gpu_memory_utilization = config.gpu_memory_utilization
+    cfg.generator.http_endpoint_host = config.http_endpoint_host
+    cfg.generator.http_endpoint_port = config.http_endpoint_port
 
     return cfg
 
@@ -107,6 +152,8 @@ class SkyRLTrainBackend(AbstractBackend):
 
         # Build config
         self._cfg = _build_config(self.base_model, self.config, lora_config)
+
+        logger.info(f"Creating model {model_id} with config: {self._cfg}")
 
         if not ray.is_initialized():
             logger.info("Initializing Ray with runtime environment")
@@ -337,13 +384,17 @@ class SkyRLTrainBackend(AbstractBackend):
         self._validate_model_state(model_id)
 
         # Create temp directory for HuggingFace export
-        with tempfile.TemporaryDirectory() as temp_dir:
-            hf_dir = os.path.join(temp_dir, "model")
+        # with tempfile.TemporaryDirectory() as temp_dir:
+        #     hf_dir = os.path.join(temp_dir, "model")
 
-            # Save in HuggingFace format (model weights + tokenizer only)
-            self._trainer.dispatch.save_hf_model(model="policy", hf_model_dir=hf_dir, tokenizer=self._tokenizer)
 
-            # Create tar archive
-            self._create_tar_from_directory(hf_dir, output_path)
+        hf_dir = os.path.join(os.environ.get("HF_HOME", "/tmp"), "model")
+        os.makedirs(hf_dir, exist_ok=True)
+        # Save in HuggingFace format (model weights + tokenizer only)
+        logger.info(f"Saving sampler checkpoint for {model_id} in HuggingFace format to {hf_dir}...")
+        self._trainer.dispatch.save_hf_model(model="policy", export_dir=hf_dir, tokenizer=self._tokenizer)
+
+        # Create tar archive
+        self._create_tar_from_directory(hf_dir, output_path)
 
         logger.info(f"Saved sampler checkpoint for {model_id} to {output_path}")

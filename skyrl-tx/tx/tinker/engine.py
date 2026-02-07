@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+import sys
+print("sys path: ", sys.path, flush=True)
+
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
@@ -199,6 +202,7 @@ class TinkerEngine:
 
         # Initialize the backend (handles model state, computation, and adapter management)
         backend_class, backend_config_class = get_backend_classes(config.backend)
+        logger.info(f"Initializing backend '{config.backend_config}' with base model '{config.base_model}'...")
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
 
