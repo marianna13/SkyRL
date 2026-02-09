@@ -57,9 +57,14 @@ def prepare_sample_batch(
             checkpoint_path = str(
                 checkpoints_base / model_id / "sampler_weights" / f"{request_data.checkpoint_id}.tar.gz"
             )
-        for _ in range(request_data.num_samples):
+        for sample_idx in range(request_data.num_samples):
             all_prompts.append(prompt_tokens)
-            all_sampling_params.append(request_data.sampling_params)
+            # Derive a unique seed per sample so that num_samples > 1 produces
+            # diverse sequences, matching vLLM's behavior (seed + index).
+            sample_params = request_data.sampling_params.model_copy(
+                update={"seed": request_data.sampling_params.seed + sample_idx}
+            )
+            all_sampling_params.append(sample_params)
             all_model_ids.append(model_id)
             all_checkpoint_ids.append(request_data.checkpoint_id)
             all_checkpoint_paths.append(checkpoint_path)
@@ -499,9 +504,14 @@ class TinkerEngine:
         checkpoint_id = Path(request_data.path).name
         output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
+        # When the caller provides a sampling_session_seq_id the save is
+        # transient — weights only need to reach the inference engines, not
+        # disk.  Backends can skip the expensive write in that case.
+        persist = request_data.sampling_session_seq_id is None
+
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            self.backend.save_sampler_checkpoint(output_path, model_id)
-            logger.info(f"Saved LoRA adapter weights for model {model_id} to {output_path}")
+            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
+            logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)
         if request_data.sampling_session_seq_id is not None and request_data.seq_id is not None:

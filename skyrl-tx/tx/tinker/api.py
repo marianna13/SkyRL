@@ -31,7 +31,7 @@ from tx.tinker.db_models import (
 )
 from tx.tinker.extra import ExternalInferenceClient
 from tx.utils.storage import download_file
-from tx.utils.log import logger
+from tx.utils.log import logger, get_uvicorn_log_config
 
 # Validation patterns for train_run_ids, model_ids and checkpoint_ids
 ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -883,7 +883,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             sampling_params=request.sampling_params.to_types(),
             num_samples=request.num_samples,
             checkpoint_id=checkpoint_id,
-            prompt_logprobs=request.prompt_logprobs,
+            prompt_logprobs=request.prompt_logprobs if request.prompt_logprobs is not None else False,
         ),
     )
 
@@ -891,7 +891,9 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 
     if req.app.state.external_inference_client:
         asyncio.create_task(
-            req.app.state.external_inference_client.call_and_store_result(request_id, request, model_id, checkpoint_id)
+            req.app.state.external_inference_client.call_and_store_result(
+                request_id, request, model_id, checkpoint_id, base_model=base_model
+            )
         )
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
@@ -1169,4 +1171,4 @@ if __name__ == "__main__":
     # Store config in app.state so lifespan can access it
     app.state.engine_config = engine_config
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_config=get_uvicorn_log_config())
