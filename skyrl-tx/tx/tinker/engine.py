@@ -7,9 +7,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-import sys
-print("sys path: ", sys.path, flush=True)
-
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
@@ -108,6 +105,8 @@ def prepare_model_pass_batch(
     request_batch_slices = []
 
     for request_id, (model_id, request_data) in requests.items():
+
+        logger.info(f"Preparing request {request_id} for model {model_id} with loss_fn {request_data.loss_fn}")
         loss_fn_type = LOSS_TYPES[request_data.loss_fn]
 
         request_start = len(all_input_ids)
@@ -287,6 +286,11 @@ class TinkerEngine:
         # Filter: only include ops that come before their model's barrier
         batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
 
+
+        if len(batchable) > 0:
+            logger.info(f"Found {len(batchable)} batchable '{request_type.value}' requests out of {len(ops)} total pending")
+            logger.info(f"Batchable request IDs: {[str(op.request_id) for op in batchable]} with length {[len(op.request_data[list(op.request_data.keys())[0]]) for op in batchable]}")
+
         return {
             str(f.request_id): (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data))
             for f in batchable
@@ -447,7 +451,10 @@ class TinkerEngine:
 
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
+
+        logger.info(f"{__file__}, requests: {requests.keys()} sequences")
         prepared = prepare_model_pass_batch(requests)
+        logger.info(f"{__file__}, prepared batch: {len(prepared.all_input_ids)} sequences")
         return self.backend.forward_backward(prepared)
 
     def process_forward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:

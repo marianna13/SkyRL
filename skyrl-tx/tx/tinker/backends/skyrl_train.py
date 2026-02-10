@@ -50,28 +50,104 @@ except Exception as e:  # pragma: no cover - exercised only in non-ray installs
     traceback.print_exc()
 
 
-class SkyRLTrainBackendConfig(BaseModel, extra="forbid"):
+#  data.train_data="['$DATA_DIR/train.parquet']" \
+#     data.val_data="['$DATA_DIR/validation.parquet']" \
+#     trainer.fully_async.max_staleness_steps=${MAX_STALENESS_STEPS} \
+#     trainer.fully_async.num_parallel_generation_workers=${NUM_PARALLEL_GENERATION_WORKERS} \
+#     trainer.algorithm.advantage_estimator="grpo" \
+#     trainer.algorithm.use_tis=$USE_TIS \
+#     trainer.algorithm.tis_imp_ratio_cap=$TIS_IMP_RATIO_CAP \
+#     trainer.algorithm.use_kl_loss=true \
+#     trainer.placement.colocate_all=false \
+#     trainer.strategy=fsdp2 \
+#     trainer.policy.model.path=${MODEL_PATH} \
+#     trainer.placement.policy_num_nodes=$POLICY_NUM_NODES \
+#     trainer.placement.ref_num_nodes=$REF_NUM_NODES \
+#     trainer.placement.policy_num_gpus_per_node=4 \
+#     trainer.placement.ref_num_gpus_per_node=4 \
+#     generator.num_inference_engines=$NUM_INFERENCE_ENGINES \
+#     generator.inference_engine_tensor_parallel_size=$TENSOR_PARALLEL_SIZE \
+#     +generator.engine_init_kwargs.custom_chat_template_chat_completion_path=$CHAT_TEMPLATE_PATH \
+#     trainer.epochs=$EPOCHS \
+#     trainer.eval_batch_size=$EVAL_BATCH_SIZE \
+#     trainer.eval_before_train=false \
+#     trainer.eval_interval=$EVAL_INTERVAL \
+#     trainer.update_epochs_per_batch=1 \
+#     trainer.train_batch_size=$TRAIN_BATCH_SIZE \
+#     trainer.policy_mini_batch_size=$TRAIN_BATCH_SIZE \
+#     trainer.micro_forward_batch_size_per_gpu=4 \
+#     trainer.micro_train_batch_size_per_gpu=4 \
+#     trainer.ckpt_interval=5 \
+#     trainer.max_prompt_length=2048 \
+#     generator.sampling_params.max_generate_length=1024 \
+#     trainer.policy.optimizer_config.lr=1.0e-6 \
+#     trainer.policy.optimizer_config.weight_decay=0.01 \
+#     generator.n_samples_per_prompt=8 \
+#     generator.gpu_memory_utilization=0.8 \
+#     generator.eval_n_samples_per_prompt=1 \
+#     trainer.logger=wandb \
+#     trainer.run_name="$RUN_NAME" \
+#     trainer.resume_mode=latest \
+#     generator.backend=vllm \
+#     generator.run_engines_locally=true \
+#     generator.weight_sync_backend=nccl \
+#     generator.async_engine=true \
+#     generator.batched=false \
+#     generator.enable_http_endpoint=true \
+
+
+
+    
+class GeneratorConfig(BaseModel, extra="allow"):
+    """Subset of SkyRL-Train config relevant for generator setup."""
+
+    num_inference_engines: int = 0
+    weight_sync_backend: str = "nccl"
+    enable_http_endpoint: bool = False
+    http_endpoint_host: str = "localhost"
+    http_endpoint_port: int = 8800
+    gpu_memory_utilization: float = 0.8
+    inference_engine_tensor_parallel_size: int = 1
+
+class AlgorithmConfig(BaseModel, extra="allow"):
+    """Subset of SkyRL-Train config relevant for algorithm setup."""
+
+    advantage_estimator: str = "grpo"
+    use_kl_loss: bool = True
+
+class PlacementConfig(BaseModel, extra="allow"):
+    """Subset of SkyRL-Train config relevant for placement setup."""
+
+    colocate_all: bool = False
+    policy_num_nodes: int = 1
+    ref_num_nodes: int = 1
+    policy_num_gpus_per_node: int = 4
+    ref_num_gpus_per_node: int = 4
+
+
+class TrainerConfig(BaseModel, extra="allow"):
+    """Subset of SkyRL-Train config relevant for trainer setup."""
+
+    strategy: str = "fsdp2"
+    train_batch_size: int = 256
+    eval_batch_size: int = 1024
+    micro_forward_batch_size_per_gpu: int = 4
+    micro_train_batch_size_per_gpu: int = 4
+    algorithm: AlgorithmConfig = AlgorithmConfig()
+    placement: PlacementConfig = PlacementConfig()
+
+
+
+
+class SkyRLTrainBackendConfig(BaseModel, extra="allow"):
     """Configuration for the SkyRL-Train backend.
 
     Note: Currently uses SkyRL's default config for all parameters.
     TODO: Implement proper config management to allow Tinker users to override
     training and inference parameters via backend_config.
     """
-
-    num_inference_engines: int = 1
-    advantage_estimator: str = "gae"
-    use_kl_loss: bool = False
-    colocate_all: bool = True
-    strategy: str = "fsdp2"
-    policy_num_nodes: int = 1
-    ref_num_nodes: int = 0
-    policy_num_gpus_per_node: int = 4
-    ref_num_gpus_per_node: int = 0
-    weight_sync_backend: str = "nccl"
-    enable_http_endpoint: bool = False
-    gpu_memory_utilization: float = 0.95
-    http_endpoint_host: str = "127.0.0.1"
-    http_endpoint_port: int = 8000
+    trainer: TrainerConfig = TrainerConfig()
+    generator: GeneratorConfig = GeneratorConfig()
 
 
 
@@ -80,6 +156,7 @@ def _build_config(
     base_model: str,
     config: SkyRLTrainBackendConfig,
     lora_config: types.LoraConfig | None = None,
+    **kwargs,
 ):
     """Build config for SkyRL-Train workers using default config.
 
@@ -96,31 +173,32 @@ def _build_config(
     cfg.trainer.policy.optimizer_config.num_warmup_steps = 0
 
 
-    #  trainer.algorithm.advantage_estimator="grpo" \
-    # trainer.algorithm.use_kl_loss=true \
-    # trainer.placement.colocate_all=false \
-    # trainer.strategy=fsdp2 \
-    # trainer.policy.model.path=${MODEL_PATH} \
-    # trainer.placement.policy_num_nodes=$POLICY_NUM_NODES \
-    # trainer.placement.ref_num_nodes=$REF_NUM_NODES \
-    # trainer.placement.policy_num_gpus_per_node=4 \
-    # trainer.placement.ref_num_gpus_per_node=4 \
-    
 
-    cfg.trainer.algorithm.advantage_estimator = config.advantage_estimator
-    cfg.trainer.algorithm.use_kl_loss = config.use_kl_loss
-    cfg.trainer.placement.colocate_all = config.colocate_all
-    cfg.trainer.strategy = config.strategy
-    cfg.trainer.placement.policy_num_nodes = config.policy_num_nodes
-    cfg.trainer.placement.ref_num_nodes = config.ref_num_nodes
-    cfg.trainer.placement.policy_num_gpus_per_node = config.policy_num_gpus_per_node
-    cfg.trainer.placement.ref_num_gpus_per_node = config.ref_num_gpus_per_node
-    cfg.generator.num_inference_engines = config.num_inference_engines
-    cfg.generator.weight_sync_backend = config.weight_sync_backend
-    cfg.generator.enable_http_endpoint = config.enable_http_endpoint
-    cfg.generator.gpu_memory_utilization = config.gpu_memory_utilization
-    cfg.generator.http_endpoint_host = config.http_endpoint_host
-    cfg.generator.http_endpoint_port = config.http_endpoint_port
+    cfg.trainer.algorithm.advantage_estimator = config.trainer.algorithm.advantage_estimator
+    cfg.trainer.algorithm.use_kl_loss = config.trainer.algorithm.use_kl_loss
+    cfg.trainer.placement.colocate_all = config.trainer.placement.colocate_all
+    cfg.trainer.strategy = config.trainer.strategy
+    cfg.trainer.placement.policy_num_nodes = config.trainer.placement.policy_num_nodes
+    cfg.trainer.placement.ref_num_nodes = config.trainer.placement.ref_num_nodes
+    cfg.trainer.placement.policy_num_gpus_per_node = config.trainer.placement.policy_num_gpus_per_node
+    cfg.trainer.placement.ref_num_gpus_per_node = config.trainer.placement.ref_num_gpus_per_node
+    cfg.trainer.train_batch_size = config.trainer.train_batch_size
+    cfg.trainer.eval_batch_size = config.trainer.eval_batch_size
+    cfg.trainer.micro_forward_batch_size_per_gpu = config.trainer.micro_forward_batch_size_per_gpu
+    cfg.trainer.micro_train_batch_size_per_gpu = config.trainer.micro_train_batch_size_per_gpu
+    cfg.generator.num_inference_engines = config.generator.num_inference_engines
+    cfg.generator.inference_engine_tensor_parallel_size = config.generator.inference_engine_tensor_parallel_size
+    cfg.generator.weight_sync_backend = config.generator.weight_sync_backend
+    cfg.generator.enable_http_endpoint = config.generator.enable_http_endpoint
+    cfg.generator.gpu_memory_utilization = config.generator.gpu_memory_utilization
+    cfg.generator.http_endpoint_host = config.generator.http_endpoint_host
+    cfg.generator.http_endpoint_port = config.generator.http_endpoint_port
+
+    for key, value in kwargs.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+        else:
+            logger.warning(f"Unknown config key '{key}' - ignoring")
 
     return cfg
 
@@ -283,6 +361,7 @@ class SkyRLTrainBackend(AbstractBackend):
             return {}
 
         batch = self._to_training_batch(prepared_batch)
+        logger.info(f"batch length: {len(batch)}")
         data = self._trainer.dispatch.forward_backward("policy", batch, loss_fn=loss_fn)
 
         results = {}
@@ -527,11 +606,13 @@ class SkyRLTrainBackend(AbstractBackend):
             logger.info(f"Synced weights for {model_id} to inference engines via NCCL")
 
         if persist:
-            # Full HuggingFace model export to disk
-            with tempfile.TemporaryDirectory() as temp_dir:
-                hf_dir = os.path.join(temp_dir, "model")
-                self._trainer.dispatch.save_hf_model(model="policy", export_dir=hf_dir, tokenizer=self._tokenizer)
-                self._create_tar_from_directory(hf_dir, output_path)
+            
+            hf_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            os.makedirs(hf_dir, exist_ok=True)
+            hf_dir = os.path.join(hf_dir, f"tinker_sampler_{model_id}")
+            os.makedirs(hf_dir, exist_ok=True)
+            self._trainer.dispatch.save_hf_model(model="policy", export_dir=hf_dir, tokenizer=self._tokenizer)
+            self._create_tar_from_directory(hf_dir, output_path)
             logger.info(f"Saved sampler checkpoint for {model_id} to {output_path}")
         else:
             # Hot path: write a lightweight marker so the engine's checkpoint

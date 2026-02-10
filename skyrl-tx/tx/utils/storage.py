@@ -6,7 +6,15 @@ import tarfile
 from tempfile import TemporaryDirectory
 from typing import Generator
 
-import jax
+
+try:
+    import jax
+except ImportError:
+    # If JAX isn't installed, define a dummy jax.process_index that always returns 0
+    class jax:
+        @staticmethod
+        def process_index():
+            return 0
 from cloudpathlib import AnyPath
 
 from tx.utils.log import logger
