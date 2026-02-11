@@ -96,8 +96,12 @@ except Exception as e:  # pragma: no cover - exercised only in non-ray installs
 #     generator.enable_http_endpoint=true \
 
 
+class FSDPConfig(BaseModel, extra="allow"):
+    cpu_offload: bool = False
 
-    
+class PolicyConfig(BaseModel, extra="allow"):
+    fsdp_config: FSDPConfig = FSDPConfig()
+
 class GeneratorConfig(BaseModel, extra="allow"):
     """Subset of SkyRL-Train config relevant for generator setup."""
 
@@ -135,7 +139,7 @@ class TrainerConfig(BaseModel, extra="allow"):
     micro_train_batch_size_per_gpu: int = 4
     algorithm: AlgorithmConfig = AlgorithmConfig()
     placement: PlacementConfig = PlacementConfig()
-
+    policy: PolicyConfig = PolicyConfig()
 
 
 
@@ -148,6 +152,7 @@ class SkyRLTrainBackendConfig(BaseModel, extra="allow"):
     """
     trainer: TrainerConfig = TrainerConfig()
     generator: GeneratorConfig = GeneratorConfig()
+    dp_size: int = 1  # Data parallel size for training
 
 
 
@@ -193,6 +198,10 @@ def _build_config(
     cfg.generator.gpu_memory_utilization = config.generator.gpu_memory_utilization
     cfg.generator.http_endpoint_host = config.generator.http_endpoint_host
     cfg.generator.http_endpoint_port = config.generator.http_endpoint_port
+
+
+    cfg.trainer.policy.fsdp_config = config.trainer.policy.fsdp_config.dict()
+    # cfg.dp_size = config.dp_size
 
     for key, value in kwargs.items():
         if hasattr(cfg, key):

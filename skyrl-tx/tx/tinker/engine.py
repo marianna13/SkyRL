@@ -10,6 +10,7 @@ from typing import Callable
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
+from sqlalchemy.pool import NullPool
 
 from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, CheckpointStatus, ModelDB, SessionDB
 from tx.tinker import types
@@ -202,7 +203,11 @@ class TinkerEngine:
     ):
         """Initialize the engine with a database connection and base model."""
         self.config = config
-        self.db_engine = create_engine(config.database_url, echo=False)
+        self.db_engine = create_engine(
+            config.database_url, 
+            echo=False,
+            poolclass=NullPool
+            )
 
         # Initialize the backend (handles model state, computation, and adapter management)
         backend_class, backend_config_class = get_backend_classes(config.backend)
@@ -214,6 +219,12 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+        policy_num_nodes = self.backend.config.trainer.placement.policy_num_nodes if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
+        policy_num_gpus_per_node = self.backend.config.trainer.placement.policy_num_gpus_per_node if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
+
+        self.dp_size = policy_num_nodes * policy_num_gpus_per_node
+        logger.info(f"Data parallel size (dp_size) set to {self.dp_size} based on backend placement config: policy_num_nodes={policy_num_nodes}, policy_num_gpus_per_node={policy_num_gpus_per_node}")
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -286,15 +297,18 @@ class TinkerEngine:
         # Filter: only include ops that come before their model's barrier
         batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
 
+        total_len = 0
 
         if len(batchable) > 0:
             logger.info(f"Found {len(batchable)} batchable '{request_type.value}' requests out of {len(ops)} total pending")
             logger.info(f"Batchable request IDs: {[str(op.request_id) for op in batchable]} with length {[len(op.request_data[list(op.request_data.keys())[0]]) for op in batchable]}")
 
+            total_len = sum([len(op.request_data[list(op.request_data.keys())[0]]) for op in batchable])
+
         return {
             str(f.request_id): (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data))
             for f in batchable
-        }
+        }, total_len
 
     def find_batchable_sample(self, session: Session) -> dict[str, tuple[str, types.SampleInput]]:
         """Find all sample ops that can be safely batched together.
@@ -621,14 +635,31 @@ class TinkerEngine:
 
     def process_pending_requests(self):
         """Main loop to process pending requests."""
+        num_retries = 0
+        max_retries = 5
         while True:
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
+
+                logger.info(f"Backend '{self.config.backend}' with data parallel size {self.dp_size}")
                 # Use look-ahead scheduling to find batchable forward_backward and forward model passes
-                forward_backward_requests = self.find_batchable_model_passes(
+                forward_backward_requests, total_len = self.find_batchable_model_passes(
                     session, types.RequestType.FORWARD_BACKWARD
                 )
-                forward_requests = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
+
+
+                # check if it's divisible by dp_size, if not, we may have to wait for more requests to fill the batch.
+                if total_len > 0 and total_len % self.dp_size != 0:
+                    logger.warning(f"Number of batchable forward/backward requests ({total_len}) is not divisible by data parallel size ({self.dp_size}). This may lead to suboptimal performance. Waiting for more requests to arrive to fill the batch...{total_len}/{self.dp_size} currently.")
+                    logger.warning(f"Batchable forward/backward request IDs: {list(forward_backward_requests.keys())}")
+                    time.sleep(1)  # Sleep briefly to allow more requests to arrive and fill the batch
+                    num_retries += 1
+                    if num_retries > max_retries:
+                        raise RuntimeError(f"Max retries reached for waiting on batchable forward/backward requests. Current batch size: {total_len}.")
+                    continue  # Re-query for batchable requests in the next loop iteration
+    
+
+                forward_requests, total_len = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
                 # Find pending sample requests that can be batched
                 sample_requests = self.find_batchable_sample(session)
                 # Get other pending requests (non forward_backward and non sampling)

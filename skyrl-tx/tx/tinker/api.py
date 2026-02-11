@@ -9,6 +9,8 @@ from contextlib import asynccontextmanager, suppress
 from sqlmodel import SQLModel, select, func
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import event
+from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import IntegrityError, TimeoutError as SATimeoutError
 import asyncio
 import os
@@ -46,7 +48,24 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
 
     db_url = get_async_database_url(app.state.engine_config.database_url)
-    app.state.db_engine = create_async_engine(db_url, echo=False)
+    engine = create_async_engine(
+        db_url, 
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"timeout": 30},  # seconds
+    )
+
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("PRAGMA busy_timeout=30000;")  # ms
+        cursor.close()
+
+    app.state.db_engine = engine
+
 
     async with app.state.db_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
