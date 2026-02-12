@@ -8,6 +8,7 @@ import asyncio
 import os
 import tarfile
 import tempfile
+import shutil
 from typing import Any
 
 import torch
@@ -135,6 +136,7 @@ class TrainerConfig(BaseModel, extra="allow"):
     strategy: str = "fsdp2"
     train_batch_size: int = 256
     eval_batch_size: int = 1024
+    ckpt_path: str | None = None
     micro_forward_batch_size_per_gpu: int = 4
     micro_train_batch_size_per_gpu: int = 4
     algorithm: AlgorithmConfig = AlgorithmConfig()
@@ -191,6 +193,9 @@ def _build_config(
     cfg.trainer.eval_batch_size = config.trainer.eval_batch_size
     cfg.trainer.micro_forward_batch_size_per_gpu = config.trainer.micro_forward_batch_size_per_gpu
     cfg.trainer.micro_train_batch_size_per_gpu = config.trainer.micro_train_batch_size_per_gpu
+    cfg.trainer.policy.fsdp_config = config.trainer.policy.fsdp_config.dict()
+    cfg.trainer.ckpt_path = config.trainer.ckpt_path
+
     cfg.generator.num_inference_engines = config.generator.num_inference_engines
     cfg.generator.inference_engine_tensor_parallel_size = config.generator.inference_engine_tensor_parallel_size
     cfg.generator.weight_sync_backend = config.generator.weight_sync_backend
@@ -200,7 +205,6 @@ def _build_config(
     cfg.generator.http_endpoint_port = config.generator.http_endpoint_port
 
 
-    cfg.trainer.policy.fsdp_config = config.trainer.policy.fsdp_config.dict()
     # cfg.dp_size = config.dp_size
 
     for key, value in kwargs.items():
@@ -572,15 +576,14 @@ class SkyRLTrainBackend(AbstractBackend):
         """Save full training checkpoint (model + optimizer + scheduler) as tar."""
         self._validate_model_state(model_id)
 
-        # Create temp directory for checkpoint
-        with tempfile.TemporaryDirectory() as temp_dir:
-            ckpt_dir = os.path.join(temp_dir, "checkpoint")
+        ckpt_dir = os.path.join(self.config.trainer.ckpt_path, "checkpoint")
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-            # Save checkpoint directory (includes optimizer state automatically)
-            self._trainer.dispatch.save_checkpoint(model="policy", ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
+        # Save checkpoint directory (includes optimizer state automatically)
+        self._trainer.dispatch.save_checkpoint(model="policy", ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
 
-            # Create tar archive
-            self._create_tar_from_directory(ckpt_dir, output_path)
+        # Create tar archive
+        self._create_tar_from_directory(ckpt_dir, output_path)
 
         logger.info(f"Saved checkpoint for {model_id} to {output_path}")
 
@@ -589,16 +592,20 @@ class SkyRLTrainBackend(AbstractBackend):
         self._validate_model_state(model_id)
 
         # Extract tar to temp directory (filter='data' prevents path traversal attacks)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with tarfile.open(checkpoint_path, "r") as tar:
-                tar.extractall(temp_dir, filter="data")
 
-            # Load checkpoint (includes optimizer and scheduler states)
-            self._trainer.dispatch.load_checkpoint(
-                model="policy", ckpt_dir=temp_dir, load_optimizer_states=True, load_lr_scheduler_states=True
-            )
+        temp_dir = os.path.join(self.config.trainer.ckpt_path, "temp_checkpoint")
+        os.makedirs(temp_dir, exist_ok=True)
+        with tarfile.open(checkpoint_path, "r") as tar:
+            tar.extractall(temp_dir, filter="data")
+
+        # Load checkpoint (includes optimizer and scheduler states)
+        self._trainer.dispatch.load_checkpoint(
+            model="policy", ckpt_dir=temp_dir, load_optimizer_states=True, load_lr_scheduler_states=True
+        )
 
         logger.info(f"Loaded checkpoint for {model_id} from {checkpoint_path}")
+
+        shutil.rmtree(temp_dir)
 
     def save_sampler_checkpoint(self, output_path, model_id: str, persist: bool = True) -> None:
         """Sync weights to colocated inference engines and optionally save to disk.
@@ -616,7 +623,7 @@ class SkyRLTrainBackend(AbstractBackend):
 
         if persist:
             
-            hf_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            hf_dir = os.path.join(self.config.trainer.ckpt_path, "hf_model")
             os.makedirs(hf_dir, exist_ok=True)
             hf_dir = os.path.join(hf_dir, f"tinker_sampler_{model_id}")
             os.makedirs(hf_dir, exist_ok=True)
