@@ -640,8 +640,6 @@ class TinkerEngine:
         while True:
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
-
-                logger.info(f"Backend '{self.config.backend}' with data parallel size {self.dp_size}")
                 # Use look-ahead scheduling to find batchable forward_backward and forward model passes
                 forward_backward_requests, total_len = self.find_batchable_model_passes(
                     session, types.RequestType.FORWARD_BACKWARD

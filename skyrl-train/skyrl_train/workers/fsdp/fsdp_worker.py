@@ -124,7 +124,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
                 # NOTE (sumanthrh): Model initialization should always be in fp32
                 # during training
-                bf16=False,
+                bf16=True,
                 lora_rank=self.cfg.trainer.policy.model.lora.rank,
                 lora_alpha=self.cfg.trainer.policy.model.lora.alpha,
                 lora_dropout=self.cfg.trainer.policy.model.lora.dropout,
@@ -382,6 +382,6 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
 
 # Ray remote actors
-PolicyWorker = ray.remote(num_gpus=1)(FSDPPolicyWorkerBase)
+PolicyWorker = ray.remote(num_gpus=1, resources={"policy_init_slot": 1})(FSDPPolicyWorkerBase)
 CriticWorker = ray.remote(num_gpus=1)(FSDPCriticWorkerBase)
 RefWorker = ray.remote(num_gpus=1)(FSDPRefWorkerBase)

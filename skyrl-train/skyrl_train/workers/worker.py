@@ -436,7 +436,7 @@ class PPORayActorGroup:
                 reordered_bundle_indices = get_reordered_bundle_indices(pg)
 
         if self._num_gpus_per_node > 1 and pg is None:
-            bundles = [{"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)]
+            bundles = [{"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node, "policy_init_slot": 1} for _ in range(self._num_nodes)]
             if self._resources:
                 resources_name = list(self._resources.keys())[0]
                 for i in range(len(bundles)):

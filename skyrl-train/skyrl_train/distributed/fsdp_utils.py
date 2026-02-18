@@ -44,6 +44,66 @@ else:
     fully_shard, MixedPrecisionPolicy, FSDPModule, CPUOffloadPolicy = None, None, None, None
 
 
+try:
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard, Replicate
+except Exception:
+    DTensor = None
+    Shard = Replicate = None
+
+
+
+def _get_mesh_dim_group(mesh, mesh_dim):
+    """
+    Return the ProcessGroup for a given mesh dimension.
+    mesh_dim can be an int (axis) or a str (mesh_dim_name).
+    Works across DeviceMesh API variants.
+    """
+    # New/official API (documented in PyTorch tutorial): get_group(mesh_dim=...)
+    try:
+        return mesh.get_group(mesh_dim=mesh_dim)
+    except Exception:
+        pass
+
+    # Fallback: get_all_groups() (some builds expose only this)
+    groups = mesh.get_all_groups()
+    # groups can be list/tuple (by axis) or dict (by name)
+    if isinstance(groups, dict):
+        return groups[mesh_dim]
+    return groups[mesh_dim]  # mesh_dim must be int here
+
+
+def _dtensor_to_full_cuda(t: "DTensor") -> torch.Tensor:
+    """
+    Materialize DTensor into a full (replicated) CUDA tensor using CUDA collectives.
+    Supports placements composed of Replicate and Shard.
+    """
+    local = t.to_local()
+    if local.device.type != "cuda":
+        local = local.cuda(non_blocking=True)
+
+    full = local
+    mesh = t.device_mesh
+    placements = t.placements
+
+    for axis, placement in enumerate(placements):
+        if isinstance(placement, Replicate):
+            continue
+        if not isinstance(placement, Shard):
+            raise RuntimeError(f"Unsupported DTensor placement: {placement}")
+
+        shard_dim = placement.dim
+        group = _get_mesh_dim_group(mesh, axis)
+        world = dist.get_world_size(group=group)
+
+        gather_list = [torch.empty_like(full) for _ in range(world)]
+        dist.all_gather(gather_list, full, group=group)
+        full = torch.cat(gather_list, dim=shard_dim)
+
+    return full
+
+
+
 def init_fn(x: torch.nn.Module):
     if torch.distributed.get_rank() != 0:
         x = x.to_empty(device=torch.cuda.current_device(), recurse=False)
@@ -534,22 +594,34 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
     return lora_params
 
 
-def collect_lora_params(module: FSDP) -> OrderedDict:
+
+def collect_lora_params(module) -> OrderedDict:
     """
-    collect lora params or full params if base model is not ready in vllm
+    Collect LoRA params or full params if base model is not ready in vllm.
     requires `module._fsdp_wrapped_module` to be a `PeftModel`
     """
-    lora_params = OrderedDict()
     peft_model = getattr(module, "_fsdp_wrapped_module", module)
+
     if fsdp_version(module) > 0:
         with FSDP.summon_full_params(module, writeback=False):
-            # If base model is synced, we can get the full state dict from peft model
-            lora_params = get_peft_model_state_dict(peft_model)
-            lora_params = {
-                name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
-                for name, param in lora_params.items()
-            }
+            sd = get_peft_model_state_dict(peft_model)
+
+            out = OrderedDict()
+            for name, param in sd.items():
+                # DTensor path: avoid .full_tensor() (may attempt CPU collectives)
+                if DTensor is not None and isinstance(param, DTensor):
+                    t = _dtensor_to_full_cuda(param).detach().cpu()
+                else:
+                    # regular tensor or FSDP param wrapper
+                    t = param.detach()
+                    if hasattr(param, "full_tensor"):  # e.g. FSDP FlatParameter
+                        # This usually works; if it still CPU-offloads, you can wrap similarly.
+                        t = param.full_tensor().detach()
+                    out[name] = t.cpu()
+
         torch.cuda.empty_cache()
-    else:
-        lora_params = get_peft_model_state_dict(peft_model)
-    return lora_params
+        return out
+
+    # non-FSDP version
+    sd = get_peft_model_state_dict(peft_model)
+    return OrderedDict((k, v.detach().cpu()) for k, v in sd.items())

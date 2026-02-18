@@ -3,6 +3,7 @@ import random
 from datetime import timedelta
 from typing import List, Union, Optional
 from jaxtyping import Float
+import gc, os, time, traceback
 
 import numpy as np
 import torch
@@ -38,6 +39,27 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from transformers import PreTrainedTokenizer
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+
+def _mem(msg=""):
+    # lightweight logging for both CPU & GPU
+    rss_gb = None
+    try:
+        import psutil
+        rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+    except Exception:
+        pass
+
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        reserv = torch.cuda.memory_reserved() / 1024**3
+        maxa  = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"[{time.strftime('%H:%M:%S')}] {msg} | "
+              f"GPU alloc={alloc:.2f}G reserv={reserv:.2f}G max={maxa:.2f}G"
+              + (f" | RSS={rss_gb:.2f}G" if rss_gb is not None else ""),
+              flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 class MegatronStrategy(DistributedStrategy):
@@ -96,13 +118,40 @@ class MegatronStrategy(DistributedStrategy):
         """
         Offload model weights and optimizer to CPU memory.
         """
-        if offload_model:
-            offload_megatron_model_to_cpu(model)
-        if optimizer and offload_optimizer:
-            offload_megatron_grads_to_cpu(model)
-            offload_megatron_optimizer(optimizer)
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        try:
+            _mem("start offload_to_cpu")
+
+            if offload_model:
+                _mem("before offload_megatron_model_to_cpu")
+                offload_megatron_model_to_cpu(model)
+                _mem("after offload_megatron_model_to_cpu")
+
+            if optimizer and offload_optimizer:
+                _mem("before offload_megatron_grads_to_cpu")
+                offload_megatron_grads_to_cpu(model)
+                _mem("after offload_megatron_grads_to_cpu")
+
+                _mem("before offload_megatron_optimizer")
+                offload_megatron_optimizer(optimizer)
+                _mem("after offload_megatron_optimizer")
+
+            # If there was a CUDA async error earlier, this is where it will surface.
+            _mem("before synchronize")
+            torch.cuda.synchronize()
+            _mem("after synchronize")
+
+        except Exception as e:
+            print("OFFLOAD FAILED:", repr(e), flush=True)
+            traceback.print_exc()
+            # This helps catch “silent” CUDA errors:
+            if torch.cuda.is_available():
+                print("CUDA error state:", torch.cuda.get_device_properties(0), flush=True)
+            raise
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _mem("end offload_to_cpu")
 
     def backload_to_gpu(self, model, optimizer, non_blocking=True, backload_optimizer=True, backload_model=True):
         """Reload model weights back to GPU."""

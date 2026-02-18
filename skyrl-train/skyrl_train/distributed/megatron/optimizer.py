@@ -66,8 +66,8 @@ def get_megatron_optimizer_param_scheduler(
     Get the optimizer parameter scheduler for Megatron.
     """
     # TODO: support other schedulers for Megatron
-    if getattr(config, "scheduler", "constant_with_warmup") != "constant_with_warmup":
-        raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
+    # if getattr(config, "scheduler", "constant_with_warmup") != "constant_with_warmup":
+    #     raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
 
     lr_warmup_steps = config.num_warmup_steps
     if getattr(config, "lr_decay_steps", None) is None:
@@ -76,6 +76,11 @@ def get_megatron_optimizer_param_scheduler(
         getattr(config, "lr_warmup_steps", None) is None or getattr(config, "lr_warmup_steps", None) <= 0
     ):
         lr_warmup_steps = int(config.lr_warmup_steps_ratio * lr_decay_steps)
+
+    if isinstance(lr_decay_steps, type(None)) and num_training_steps is None:
+        lr_decay_steps = 1000
+
+    print(f"Initializing Megatron optimizer parameter scheduler with lr_warmup_steps={lr_warmup_steps} and lr_decay_steps={lr_decay_steps}, num_training_steps={num_training_steps}")
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,

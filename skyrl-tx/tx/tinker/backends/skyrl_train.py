@@ -100,8 +100,34 @@ except Exception as e:  # pragma: no cover - exercised only in non-ray installs
 class FSDPConfig(BaseModel, extra="allow"):
     cpu_offload: bool = False
 
+class LoraConfig(BaseModel, extra="allow"):
+    rank: int = 32
+    alpha: int = 32
+    dropout: float = 0.1
+    lora_sync_path: str = "/tmp/lora_sync"  # Shared path for synchronizing LoRA weights between trainer and inference engines
+
+class ModelConfig(BaseModel, extra="allow"):
+    lora: LoraConfig = LoraConfig()
+
+class MegatronConfig(BaseModel, extra="allow"):
+    tensor_model_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
+
+
+class OptimizerConfig(BaseModel, extra="allow"):
+    lr: float = 1e-6
+    weight_decay: float = 0.01
+    scheduler: str = "constant"
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    max_warmup_steps: int = 0
+    lr_decay_steps: int | None = None
+
 class PolicyConfig(BaseModel, extra="allow"):
     fsdp_config: FSDPConfig = FSDPConfig()
+    model: ModelConfig = ModelConfig()
+    megatron_config: MegatronConfig = MegatronConfig()
+    optimizer_config: OptimizerConfig = OptimizerConfig()
 
 class GeneratorConfig(BaseModel, extra="allow"):
     """Subset of SkyRL-Train config relevant for generator setup."""
@@ -144,7 +170,6 @@ class TrainerConfig(BaseModel, extra="allow"):
     policy: PolicyConfig = PolicyConfig()
 
 
-
 class SkyRLTrainBackendConfig(BaseModel, extra="allow"):
     """Configuration for the SkyRL-Train backend.
 
@@ -176,8 +201,13 @@ def _build_config(
     cfg.trainer.policy.model.path = base_model
 
     # Disable scheduler - Tinker manages learning rate externally via set_lr()
-    cfg.trainer.policy.optimizer_config.scheduler = "constant"
-    cfg.trainer.policy.optimizer_config.num_warmup_steps = 0
+    cfg.trainer.policy.optimizer_config.scheduler = config.trainer.policy.optimizer_config.scheduler
+    cfg.trainer.policy.optimizer_config.num_warmup_steps = config.trainer.policy.optimizer_config.max_warmup_steps
+    cfg.trainer.policy.optimizer_config.lr = config.trainer.policy.optimizer_config.lr
+    cfg.trainer.policy.optimizer_config.weight_decay = config.trainer.policy.optimizer_config.weight_decay
+    cfg.trainer.policy.optimizer_config.adam_betas = config.trainer.policy.optimizer_config.adam_betas
+    # print(f"Setting optimizer config: {config.trainer.policy.optimizer_config}")
+    # setattr(cfg.trainer.policy.optimizer_config, "lr_decay_steps", config.trainer.policy.optimizer_config.lr_decay_steps)
 
 
 
@@ -195,6 +225,16 @@ def _build_config(
     cfg.trainer.micro_train_batch_size_per_gpu = config.trainer.micro_train_batch_size_per_gpu
     cfg.trainer.policy.fsdp_config = config.trainer.policy.fsdp_config.dict()
     cfg.trainer.ckpt_path = config.trainer.ckpt_path
+
+    cfg.trainer.policy.model.lora.rank = lora_config.rank if lora_config else config.trainer.policy.model.lora.rank
+    cfg.trainer.policy.model.lora.alpha = config.trainer.policy.model.lora.alpha
+    cfg.trainer.policy.model.lora.dropout = config.trainer.policy.model.lora.dropout
+    cfg.trainer.policy.model.lora.lora_sync_path = config.trainer.policy.model.lora.lora_sync_path
+
+    cfg.trainer.policy.megatron_config.tensor_model_parallel_size = config.trainer.policy.megatron_config.tensor_model_parallel_size
+    cfg.trainer.policy.megatron_config.expert_model_parallel_size = config.trainer.policy.megatron_config.expert_model_parallel_size
+    cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = config.trainer.policy.megatron_config.expert_tensor_parallel_size
+
 
     cfg.generator.num_inference_engines = config.generator.num_inference_engines
     cfg.generator.inference_engine_tensor_parallel_size = config.generator.inference_engine_tensor_parallel_size

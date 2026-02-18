@@ -74,6 +74,35 @@ from skyrl_train.workers.worker import PPORayActorGroup
 from skyrl_train.workers.worker_dispatch import WorkerDispatch
 from skyrl_train.workers.worker_utils import reduce_metrics
 
+import asyncio, ray
+
+@ray.remote
+class OffloadGate:
+    def __init__(self, k: int):
+        self.k = k
+        self.inflight = 0
+
+    async def acquire(self):
+        while self.inflight >= self.k:
+            await asyncio.sleep(0.05)
+        self.inflight += 1
+
+    def release(self):
+        self.inflight -= 1
+
+@ray.remote
+class InitGate:
+    def __init__(self, k=1):
+        self.k = k
+        self.inflight = 0
+    async def acquire(self):
+        import asyncio
+        while self.inflight >= self.k:
+            await asyncio.sleep(0.05)
+        self.inflight += 1
+    def release(self):
+        self.inflight -= 1
+
 
 class RayPPOTrainer:
     def __init__(
@@ -381,6 +410,8 @@ class RayPPOTrainer:
         cfg = self.cfg
         pg = None
 
+        gate = OffloadGate.remote(k=1)
+
         use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
 
         if cfg.trainer.placement.colocate_all:
@@ -514,26 +545,36 @@ class RayPPOTrainer:
         if not cfg.trainer.placement.colocate_all:
             refs = []
             if ref_model is not None:
-                refs.extend(ref_model.async_init_model(cfg.trainer.ref.model.path))
-            refs.extend(
-                policy_model.async_init_model(
-                    cfg.trainer.policy.model.path,
-                    num_training_steps=policy_num_training_steps,
+                ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
+
+            ray.get(gate.acquire.remote())
+            try:
+                ray.get(
+                    policy_model.async_init_model(
+                        cfg.trainer.policy.model.path,
+                        num_training_steps=policy_num_training_steps,
+                    )
                 )
-            )
+            finally:
+                ray.get(gate.release.remote())
             if cfg.trainer.critic.model.path:
-                refs.extend(
+                ray.get(
                     critic_model.async_init_model(
                         cfg.trainer.critic.model.path,
                         num_training_steps=critic_num_training_steps,
                     )
                 )
-            ray.get(refs)
+            # ray.get(refs)
             ray.get(policy_model.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
         else:
             if ref_model is not None:
                 ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
-                ref_model.offload_to_cpu()
+                try:
+                    ref_model.offload_to_cpu()
+                except Exception as e:
+                    gate.release.remote()
+
+            
             ray.get(
                 policy_model.async_init_model(
                     cfg.trainer.policy.model.path,
