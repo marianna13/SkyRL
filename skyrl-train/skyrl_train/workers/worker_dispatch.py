@@ -22,6 +22,36 @@ from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
 from skyrl_train.workers.worker import PPORayActorGroup
 from skyrl_train.distributed.dispatch import MeshDispatch
 
+from pathlib import Path
+import os, re
+
+def _read(path):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return None
+
+def log_mem(tag):
+    # cgroup v2
+    cur = _read("/sys/fs/cgroup/memory.current")
+    lim = _read("/sys/fs/cgroup/memory.max")
+    # cgroup v1 fallback
+    if cur is None:
+        cur = _read("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        lim = _read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    # process view
+    status = Path("/proc/self/status").read_text()
+    def grab(k):
+        m = re.search(rf"^{k}:\s+(.+)$", status, flags=re.M)
+        return m.group(1) if m else "?"
+    print(
+        f"[{tag}] pid={os.getpid()} "
+        f"cgroup_cur={cur} cgroup_lim={lim} "
+        f"VmRSS={grab('VmRSS')} VmSize={grab('VmSize')}",
+        flush=True,
+    )
+
 
 @dataclass
 class GPUState:
@@ -267,10 +297,12 @@ class WorkerDispatch:
 
     def optim_step(self, model: str) -> Optional[float]:
         """Run optimizer step. Model should already be on GPU from forward_backward."""
+        log_mem("optim_step:pre")
         refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
         grad_norms = ray.get(refs)
 
         self._save_memory_snapshot(model, "optim_step")
+        log_mem("optim_step:post")
         return grad_norms[0]
 
     def set_lr(self, model: str, learning_rate: float) -> None:
