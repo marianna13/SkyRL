@@ -150,6 +150,7 @@ class PlacementConfig(BaseModel, extra="allow"):
     """Subset of SkyRL-Train config relevant for placement setup."""
 
     colocate_all: bool = False
+    colocate_policy_ref: bool = True  # Whether to colocate policy and ref workers (if not colocate_all)
     policy_num_nodes: int = 1
     ref_num_nodes: int = 1
     policy_num_gpus_per_node: int = 4
@@ -214,6 +215,7 @@ def _build_config(
     cfg.trainer.algorithm.advantage_estimator = config.trainer.algorithm.advantage_estimator
     cfg.trainer.algorithm.use_kl_loss = config.trainer.algorithm.use_kl_loss
     cfg.trainer.placement.colocate_all = config.trainer.placement.colocate_all
+    cfg.trainer.placement.colocate_policy_ref = config.trainer.placement.colocate_policy_ref
     cfg.trainer.strategy = config.trainer.strategy
     cfg.trainer.placement.policy_num_nodes = config.trainer.placement.policy_num_nodes
     cfg.trainer.placement.ref_num_nodes = config.trainer.placement.ref_num_nodes
