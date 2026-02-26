@@ -99,6 +99,8 @@ except Exception as e:  # pragma: no cover - exercised only in non-ray installs
 
 class FSDPConfig(BaseModel, extra="allow"):
     cpu_offload: bool = False
+    fsdp_size: int = -1  # -1 means full model in each shard
+    reshard_after_forward: bool = False
 
 class LoraConfig(BaseModel, extra="allow"):
     rank: int = 32
@@ -113,6 +115,8 @@ class MegatronConfig(BaseModel, extra="allow"):
     tensor_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
     expert_tensor_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    transformer_config_kwargs: dict[str, Any] = {}  # Additional kwargs to pass to the model's transformer config (e.g. for custom attention implementations)
 
 
 class OptimizerConfig(BaseModel, extra="allow"):
@@ -129,6 +133,11 @@ class PolicyConfig(BaseModel, extra="allow"):
     megatron_config: MegatronConfig = MegatronConfig()
     optimizer_config: OptimizerConfig = OptimizerConfig()
 
+class RefConfig(BaseModel, extra="allow"):
+    fsdp_config: FSDPConfig = FSDPConfig()
+    megatron_config: MegatronConfig = MegatronConfig()
+
+
 class GeneratorConfig(BaseModel, extra="allow"):
     """Subset of SkyRL-Train config relevant for generator setup."""
 
@@ -139,6 +148,11 @@ class GeneratorConfig(BaseModel, extra="allow"):
     http_endpoint_port: int = 8800
     gpu_memory_utilization: float = 0.8
     inference_engine_tensor_parallel_size: int = 1
+    model_dtype: str = "auto"  # "auto", "fp16", or "bf16"
+    run_engines_locally: bool = True
+    remote_inference_engine_urls: list[str] = []
+    override_existing_update_groups: bool = False  # Whether to override existing Ray actor groups when creating inference engines (useful for testing)
+    engine_init_kwargs: dict[str, Any] = {}  # Additional kwargs to pass to inference engine constructors (e.g. custom_chat_template_chat_completion_path)
 
 class AlgorithmConfig(BaseModel, extra="allow"):
     """Subset of SkyRL-Train config relevant for algorithm setup."""
@@ -169,6 +183,7 @@ class TrainerConfig(BaseModel, extra="allow"):
     algorithm: AlgorithmConfig = AlgorithmConfig()
     placement: PlacementConfig = PlacementConfig()
     policy: PolicyConfig = PolicyConfig()
+    ref: RefConfig = RefConfig()
 
 
 class SkyRLTrainBackendConfig(BaseModel, extra="allow"):
@@ -236,7 +251,16 @@ def _build_config(
     cfg.trainer.policy.megatron_config.tensor_model_parallel_size = config.trainer.policy.megatron_config.tensor_model_parallel_size
     cfg.trainer.policy.megatron_config.expert_model_parallel_size = config.trainer.policy.megatron_config.expert_model_parallel_size
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = config.trainer.policy.megatron_config.expert_tensor_parallel_size
+    cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = config.trainer.policy.megatron_config.pipeline_model_parallel_size
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs = config.trainer.policy.megatron_config.transformer_config_kwargs
 
+    cfg.trainer.ref.megatron_config.tensor_model_parallel_size = config.trainer.ref.megatron_config.tensor_model_parallel_size
+    cfg.trainer.ref.megatron_config.expert_model_parallel_size = config.trainer.ref.megatron_config.expert_model_parallel_size
+    cfg.trainer.ref.megatron_config.expert_tensor_parallel_size = config.trainer.ref.megatron_config.expert_tensor_parallel_size
+    cfg.trainer.ref.megatron_config.pipeline_model_parallel_size = config.trainer.ref.megatron_config.pipeline_model_parallel_size
+    cfg.trainer.ref.megatron_config.transformer_config_kwargs = config.trainer.ref.megatron_config.transformer_config_kwargs
+
+    cfg.trainer.ref.fsdp_config = config.trainer.ref.fsdp_config.dict()
 
     cfg.generator.num_inference_engines = config.generator.num_inference_engines
     cfg.generator.inference_engine_tensor_parallel_size = config.generator.inference_engine_tensor_parallel_size
@@ -245,6 +269,10 @@ def _build_config(
     cfg.generator.gpu_memory_utilization = config.generator.gpu_memory_utilization
     cfg.generator.http_endpoint_host = config.generator.http_endpoint_host
     cfg.generator.http_endpoint_port = config.generator.http_endpoint_port
+    cfg.generator.model_dtype = config.generator.model_dtype
+    cfg.generator.run_engines_locally = config.generator.run_engines_locally
+    cfg.generator.remote_inference_engine_urls = config.generator.remote_inference_engine_urls
+    cfg.generator.engine_init_kwargs = config.generator.engine_init_kwargs
 
 
     # cfg.dp_size = config.dp_size
@@ -319,7 +347,7 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg=self._cfg,
             tracker=tracker,
             tokenizer=self._tokenizer,
-            train_dataset=None,  # Not needed for tinker API
+            train_dataset=None,  # Datasets are passed dynamically via forward_backward() inputs
             eval_dataset=None,
             inference_engine_client=self._inference_engine_client,
             generator=None,  # TODO(tyler): Update for sampling + RL

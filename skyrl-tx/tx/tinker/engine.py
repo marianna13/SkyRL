@@ -636,7 +636,7 @@ class TinkerEngine:
     def process_pending_requests(self):
         """Main loop to process pending requests."""
         num_retries = 0
-        max_retries = 5
+        max_retries = 30
         while True:
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
@@ -655,7 +655,8 @@ class TinkerEngine:
                     if num_retries > max_retries:
                         raise RuntimeError(f"Max retries reached for waiting on batchable forward/backward requests. Current batch size: {total_len}.")
                     continue  # Re-query for batchable requests in the next loop iteration
-    
+                else:
+                    num_retries = 0  # Reset retry counter when batch is valid or empty
 
                 forward_requests, total_len = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
                 # Find pending sample requests that can be batched

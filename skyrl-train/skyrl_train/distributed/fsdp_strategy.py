@@ -8,6 +8,7 @@ from jaxtyping import Float
 import gc
 import json
 from loguru import logger
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -267,6 +268,9 @@ class FSDPStrategy(DistributedStrategy):
             module = model.model if is_wrapped else model
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.fsdp_config)
+            print(f"[rank-{self.get_rank()}]: Finished applying FSDP2 wrapping. GPU memory usage after wrapping:")
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used,memory.free", "--format=csv"], text=True)
+            print(out)
             fsdp2_load_full_state_dict(module, full_state, cpu_offload)
             fsdp_module = module
         else:

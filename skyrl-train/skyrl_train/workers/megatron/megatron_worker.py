@@ -200,6 +200,8 @@ class MegatronWorker:
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
+        print("transformer_config_kwargs:", transformer_config_kwargs)
+
         override_config_kwargs = {
             "bos_token_id": tokenizer.bos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
@@ -225,6 +227,8 @@ class MegatronWorker:
         provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
         provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+        print(f"pipeline_dtype set to {provider.pipeline_dtype}")
+
         provider.context_parallel_size = megatron_config.context_parallel_size
         provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
         provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
@@ -502,7 +506,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             actor_module=self.actor_module,
             enable_bucketing=self._transfer_strategy_cls is CudaIpcTransferStrategy,
             bucket_size_threshold_GB=self.cfg.generator.weight_transfer_threshold_cuda_ipc_GB,
-            training_dtype=torch.bfloat16 if self.cfg.trainer.bf16 else torch.float32,
+            training_dtype=torch.bfloat16,
         )
 
         self.empty_cuda_cache = self.cfg.trainer.policy.megatron_config.empty_cuda_cache
@@ -661,6 +665,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # clear prefix cache
             cache_reset_task = inference_engine_client.reset_prefix_cache()
 
+        # Offload optimizer states and gradients to CPU before weight sync
+        # to free GPU memory for the all_gather buffers during Megatron-to-HF
+        # weight conversion. Without this, large models (e.g. 120B MoE) OOM
+        # during gather_from_tp_ranks.
+        if self.optimizer is not None:
+            self.strategy.offload_to_cpu(
+                self.actor_module, self.optimizer,
+                offload_optimizer=True, offload_model=False,
+            )
+
         torch.cuda.empty_cache()
 
         # Extract and send weights using the sender created at init time
@@ -668,6 +682,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         if cache_reset_task is not None:
             await cache_reset_task
+
+        # Reload optimizer states back to GPU for next training step
+        if self.optimizer is not None:
+            self.strategy.backload_to_gpu(
+                self.actor_module, self.optimizer,
+                backload_optimizer=True, backload_model=False,
+            )
+
         torch.cuda.empty_cache()
         torch.distributed.barrier()
 

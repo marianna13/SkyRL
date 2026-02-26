@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import functools
+import subprocess
 from contextlib import nullcontext
 from typing import Union
 
@@ -252,6 +253,9 @@ def load_fsdp_model_to_gpu(model: FSDP):
 @torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
     device = torch.cuda.current_device()
+    out = subprocess.check_output(["nvidia-smi"], text=True)
+    print(f"[rank-{dist.get_rank()}]: GPU memory usage before loading model to GPU:")
+    print(out)
     model.to(device, non_blocking=True)
 
 
