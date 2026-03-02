@@ -117,6 +117,7 @@ class MegatronConfig(BaseModel, extra="allow"):
     expert_tensor_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     transformer_config_kwargs: dict[str, Any] = {}  # Additional kwargs to pass to the model's transformer config (e.g. for custom attention implementations)
+    optimizer_config_kwargs: dict[str, Any] = {}  # Additional kwargs to pass to the model's optimizer config (e.g. for offloading or precision-aware optimizers)
 
 
 class OptimizerConfig(BaseModel, extra="allow"):
@@ -243,6 +244,12 @@ def _build_config(
     cfg.trainer.policy.fsdp_config = config.trainer.policy.fsdp_config.dict()
     cfg.trainer.ckpt_path = config.trainer.ckpt_path
 
+    # Attention backend and sequence packing
+    if hasattr(config.trainer, 'flash_attn'):
+        cfg.trainer.flash_attn = config.trainer.flash_attn
+    if hasattr(config.trainer, 'use_sample_packing'):
+        cfg.trainer.use_sample_packing = config.trainer.use_sample_packing
+
     cfg.trainer.policy.model.lora.rank = lora_config.rank if lora_config else config.trainer.policy.model.lora.rank
     cfg.trainer.policy.model.lora.alpha = config.trainer.policy.model.lora.alpha
     cfg.trainer.policy.model.lora.dropout = config.trainer.policy.model.lora.dropout
@@ -253,6 +260,7 @@ def _build_config(
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = config.trainer.policy.megatron_config.expert_tensor_parallel_size
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = config.trainer.policy.megatron_config.pipeline_model_parallel_size
     cfg.trainer.policy.megatron_config.transformer_config_kwargs = config.trainer.policy.megatron_config.transformer_config_kwargs
+    cfg.trainer.policy.megatron_config.optimizer_config_kwargs = config.trainer.policy.megatron_config.optimizer_config_kwargs
 
     cfg.trainer.ref.megatron_config.tensor_model_parallel_size = config.trainer.ref.megatron_config.tensor_model_parallel_size
     cfg.trainer.ref.megatron_config.expert_model_parallel_size = config.trainer.ref.megatron_config.expert_model_parallel_size

@@ -223,8 +223,25 @@ class TinkerEngine:
         policy_num_nodes = self.backend.config.trainer.placement.policy_num_nodes if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
         policy_num_gpus_per_node = self.backend.config.trainer.placement.policy_num_gpus_per_node if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
 
-        self.dp_size = policy_num_nodes * policy_num_gpus_per_node
-        logger.info(f"Data parallel size (dp_size) set to {self.dp_size} based on backend placement config: policy_num_nodes={policy_num_nodes}, policy_num_gpus_per_node={policy_num_gpus_per_node}")
+        if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement and getattr(self.backend.config.trainer.policy, "megatron_config", None):
+            policy_tensor_parallel = self.backend.config.trainer.policy.megatron_config.tensor_model_parallel_size
+            pipeline_parallel_size = self.backend.config.trainer.policy.megatron_config.pipeline_model_parallel_size
+            logger.info(f"Detected Megatron placement config: tensor_parallel={policy_tensor_parallel}, pipeline_parallel={pipeline_parallel_size}")
+        else:
+            policy_tensor_parallel = 1
+            pipeline_parallel_size = 1
+            logger.info(f"No Megatron placement config detected, defaulting to tensor_parallel={policy_tensor_parallel}, pipeline_parallel={pipeline_parallel_size}")
+
+        self.dp_size = policy_num_nodes * policy_num_gpus_per_node // (policy_tensor_parallel * pipeline_parallel_size)
+        logger.info(f"Data parallel size (dp_size) set to {self.dp_size} based on backend placement config: policy_num_nodes={policy_num_nodes}, policy_num_gpus_per_node={policy_num_gpus_per_node}, policy_tensor_parallel={policy_tensor_parallel}   ")
+        self.gloabl_batch_size = self.backend.config.trainer.train_batch_size if getattr(self.backend.config.trainer, "train_batch_size", None) else None
+        if self.gloabl_batch_size and self.dp_size:
+            if self.gloabl_batch_size % self.dp_size != 0:
+                logger.warning(f"Global batch size {self.gloabl_batch_size} is not divisible by data parallel size {self.dp_size}. This may lead to suboptimal performance.")
+            else:
+                logger.info(f"Global batch size {self.gloabl_batch_size} is divisible by data parallel size {self.dp_size}.")
+        else:
+            logger.info(f"Global batch size or data parallel size not set, skipping divisibility check (global_batch_size={self.gloabl_batch_size}, dp_size={self.dp_size})")
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -647,9 +664,10 @@ class TinkerEngine:
 
 
                 # check if it's divisible by dp_size, if not, we may have to wait for more requests to fill the batch.
-                if total_len > 0 and total_len % self.dp_size != 0:
+                if (total_len > 0 and total_len % self.dp_size != 0) or (total_len > 0 and self.gloabl_batch_size and total_len < self.gloabl_batch_size):
                     logger.warning(f"Number of batchable forward/backward requests ({total_len}) is not divisible by data parallel size ({self.dp_size}). This may lead to suboptimal performance. Waiting for more requests to arrive to fill the batch...{total_len}/{self.dp_size} currently.")
                     logger.warning(f"Batchable forward/backward request IDs: {list(forward_backward_requests.keys())}")
+                    logger.warning(f"Global batch size: {self.gloabl_batch_size}")
                     time.sleep(1)  # Sleep briefly to allow more requests to arrive and fill the batch
                     num_retries += 1
                     if num_retries > max_retries:

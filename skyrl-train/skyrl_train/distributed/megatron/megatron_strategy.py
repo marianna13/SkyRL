@@ -213,7 +213,14 @@ class MegatronStrategy(DistributedStrategy):
         if not self.is_lora:
             sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
+            # Use 'fully_reshardable' format to correctly preserve EDP replica_id
+            # for MoE expert params. The deprecated 'fully_sharded_model_space' format
+            # discards EDP info via replica_id[:2], causing checkpoint validation
+            # failures with EP>1. (verl#4303 / Megatron-Bridge#1564)
+            optim_ckpt_metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                model_sharded_state_dict, metadata=optim_ckpt_metadata
+            )
         if scheduler:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
@@ -305,7 +312,11 @@ class MegatronStrategy(DistributedStrategy):
         if not self.is_lora:
             sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer and load_optimizer_states:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
+            # Must match save format: 'fully_reshardable' preserves EDP replica_id
+            optim_ckpt_metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                model_sharded_state_dict, is_loading=True, metadata=optim_ckpt_metadata
+            )
         if scheduler and load_lr_scheduler_states:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
