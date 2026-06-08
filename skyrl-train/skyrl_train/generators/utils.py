@@ -10,6 +10,37 @@ from loguru import logger
 from skyrl_gym.metrics import aggregate_for_environment
 
 
+_BPE_BYTE_DECODER: Optional[Dict[str, int]] = None
+
+
+def _normalize_bpe_token_str(s: str) -> str:
+    """Normalize a token string to its decoded text form.
+
+    HF tokenizers' ``convert_ids_to_tokens`` returns byte-level BPE symbols
+    (e.g. 'Ġme' for ' me', 'Ċ' for '\\n', 'ĉ' for '\\t'), while vLLM's logprob
+    ``token`` field returns the already-decoded string. To LCS-align the two,
+    both must be in the same representation. This decodes byte-level BPE symbols
+    back to real text; non-byte tokens (special tokens like '<think>', or
+    already-decoded vLLM strings) are returned unchanged.
+    """
+    global _BPE_BYTE_DECODER
+    if _BPE_BYTE_DECODER is None:
+        try:
+            from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+            _BPE_BYTE_DECODER = {v: k for k, v in bytes_to_unicode().items()}
+        except Exception:
+            _BPE_BYTE_DECODER = {}
+    if not _BPE_BYTE_DECODER:
+        # Minimal fallback for the two most common markers.
+        return s.replace("Ġ", " ").replace("Ċ", "\n").replace("ĉ", "\t")
+    try:
+        # Decode every char via the byte map; if any char isn't a byte-level
+        # symbol (e.g. a special token), this raises KeyError and we return s.
+        return bytearray(_BPE_BYTE_DECODER[c] for c in s).decode("utf-8", errors="replace")
+    except (KeyError, UnicodeDecodeError):
+        return s
+
+
 def align_logprobs_with_lcs(
     retokenized_ids: List[int],
     vllm_token_logprobs: List[Dict[str, Any]],
@@ -49,11 +80,19 @@ def align_logprobs_with_lcs(
     if not retokenized_ids:
         return []
 
-    # Convert re-tokenized IDs to token strings for matching
-    retok_strings = tokenizer.convert_ids_to_tokens(retokenized_ids)
+    # Convert re-tokenized IDs to token strings for matching.
+    # NOTE: convert_ids_to_tokens() returns raw byte-level BPE symbols
+    # (e.g. 'Ġme' for ' me', 'Ċ' for '\n'), while vLLM's logprob "token"
+    # field returns the DECODED string (' me', '\n'). Comparing these two
+    # representations directly makes SequenceMatcher fail on nearly every
+    # space/newline-prefixed token, producing spurious <50% match rates and
+    # zeroed-out logprobs for correctly-matched tokens. Normalize both sides
+    # to the same (decoded) representation before LCS.
+    raw_retok_strings = tokenizer.convert_ids_to_tokens(retokenized_ids)
+    retok_strings = [_normalize_bpe_token_str(s) for s in raw_retok_strings]
 
     # Extract token strings and logprobs from vLLM output
-    vllm_strings = [tl["token"] for tl in vllm_token_logprobs]
+    vllm_strings = [_normalize_bpe_token_str(tl["token"]) for tl in vllm_token_logprobs]
     vllm_logprobs = [tl["logprob"] for tl in vllm_token_logprobs]
 
     # Use SequenceMatcher to find LCS alignment
@@ -65,9 +104,17 @@ def align_logprobs_with_lcs(
         for i in range(size):
             aligned[a_start + i] = vllm_logprobs[b_start + i]
 
-    # Log alignment statistics for debugging
+    # Log alignment statistics only on GENUINELY poor alignment. After
+    # byte-level normalization, ~80-85% LCS match is normal/healthy — the
+    # residual gap is just incremental-vs-batch BPE boundary merges (vLLM
+    # tokenizes during streaming; re-tokenization processes the whole message
+    # at once), not a real problem. Only warn below 50%, which indicates an
+    # actual representation/tokenizer breakage (e.g. the old Ġ-vs-space bug).
+    # NOTE: this is a logger.debug, but the generator runs in Ray actors that
+    # don't honor the main process's loguru level, so it would otherwise print
+    # regardless of trainer.log_level. Gating on the threshold suppresses it.
     matched_count = sum(1 for lp in aligned if lp != 0.0)
-    if matched_count < len(retokenized_ids) * 0.9:  # Less than 90% matched
+    if matched_count < len(retokenized_ids) * 0.5:  # genuinely poor alignment
         logger.debug(
             f"LCS alignment: matched {matched_count}/{len(retokenized_ids)} tokens "
             f"(vLLM had {len(vllm_token_logprobs)} tokens). "

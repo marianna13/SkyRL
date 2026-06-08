@@ -834,12 +834,33 @@ class RayPPOTrainer:
 
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
 
+        # Per-batch reward mean/std/min/max over per-trajectory rewards.
+        # Mirrors get_metrics_from_generator_output's reduction: token-level
+        # rewards are summed per trajectory, response-level used as-is.
+        _batch_rewards = generator_output_for_metrics["rewards"]
+        if _batch_rewards and isinstance(_batch_rewards[0], list):
+            _traj_rewards = np.array([float(sum(tr)) for tr in _batch_rewards], dtype=np.float64)
+        else:
+            _traj_rewards = np.array([float(r) for r in _batch_rewards], dtype=np.float64)
+        batch_reward_std = float(np.std(_traj_rewards)) if _traj_rewards.size else 0.0
+        batch_reward_min = float(np.min(_traj_rewards)) if _traj_rewards.size else 0.0
+        batch_reward_max = float(np.max(_traj_rewards)) if _traj_rewards.size else 0.0
+
         reward_metrics = {
             f"reward/avg_pass_at_{n_samples_per_prompt}": pass_at_n,
             "reward/avg_raw_reward": mean_raw_reward,
+            "reward/raw_reward_std": batch_reward_std,
+            "reward/raw_reward_min": batch_reward_min,
+            "reward/raw_reward_max": batch_reward_max,
         }
         self.all_metrics.update(reward_metrics)
-        logger.info(f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, reward/avg_raw_reward: {mean_raw_reward}")
+        logger.info(
+            f"reward/avg_pass_at_{n_samples_per_prompt}: {pass_at_n}, "
+            f"reward/avg_raw_reward: {mean_raw_reward}, "
+            f"reward/raw_reward_std: {batch_reward_std}, "
+            f"reward/raw_reward_min: {batch_reward_min}, "
+            f"reward/raw_reward_max: {batch_reward_max}"
+        )
 
         # re-assign reward but now it's per token rewards
         generator_output["rewards"] = per_token_rewards
@@ -1476,14 +1497,21 @@ class RayPPOTrainer:
             )
 
         # 3. Load policy checkpoint
+        # reset_optimizer_on_resume: skip loading optimizer/scheduler state on resume.
+        # Useful when resuming from a checkpoint that was at an unstable point —
+        # stale Adam momentum can push the model into collapse after restart.
+        reset_optimizer = getattr(self.cfg.trainer, "reset_optimizer_on_resume", False)
+        load_opt = not reset_optimizer
+        if reset_optimizer:
+            logger.info("reset_optimizer_on_resume=True: loading model weights only, resetting optimizer state")
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
         _ = ray.get(
             self.policy_model.async_run_ray_method(
                 "pass_through",
                 "load_checkpoint",
                 ckpt_dir=policy_ckpt_dir,
-                load_optimizer_states=True,
-                load_lr_scheduler_states=True,
+                load_optimizer_states=load_opt,
+                load_lr_scheduler_states=load_opt,
             )
         )
         logger.info("Successfully loaded policy checkpoint")

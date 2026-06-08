@@ -117,11 +117,19 @@ class HFModelWrapper(nn.Module):
             if rope_theta:
                 rope_scaling_kwargs["rope_theta"] = rope_theta
 
+            if nf4_config is not None:
+                rope_scaling_kwargs["quantization_config"] = nf4_config
+
+
+            logger.info(f"Loading model {pretrain_or_model} with the following configuration:")
+            logger.info(f"  - Attention Implementation: {self.attn_implementation}")
+            logger.info(f"  - bfloat16: {bf16}")
+            logger.info(f"  - quantization_config: {nf4_config}")
+            logger.info(f"  - model_class: {model_class}")
             self.model = model_class.from_pretrained(
                 pretrain_or_model,
                 trust_remote_code=True,
                 attn_implementation=self.attn_implementation,
-                quantization_config=nf4_config,
                 torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                 device_map=device_map,
                 **rope_scaling_kwargs,

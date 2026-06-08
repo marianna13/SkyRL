@@ -296,6 +296,62 @@ class WorkerWrap:
                     ("gate_up_proj", "up_proj", 1),
                 ]
 
+                # Per-rank slicing helpers for TP>1. The sender broadcasts FULL
+                # unsharded BF16 params; each vLLM TP rank holds only its slice
+                # of the fused FP8 param. We must slice each component to the
+                # rank-local portion BEFORE concatenating + quantizing, else
+                # shape mismatch (e.g. 2560 vs 10240 at TP=4 for qkv_proj).
+                def _qkv_rank_slice(module, weight_name, full_bf16):
+                    """Slice full Q/K/V proj to this TP rank's portion.
+                    Handles GQA replication when tp_size >= total_num_kv_heads."""
+                    tp_rank = getattr(module, 'tp_rank', 0)
+                    head_size = module.head_size
+                    if weight_name == "q_proj":
+                        num_heads = module.num_heads  # per-rank
+                        start = tp_rank * num_heads * head_size
+                        size = num_heads * head_size
+                    else:  # k_proj or v_proj
+                        num_kv_heads = module.num_kv_heads  # per-rank
+                        num_kv_replicas = getattr(module, 'num_kv_head_replicas', 1)
+                        # When KV heads are replicated across ranks, multiple
+                        # ranks share the same slice of the source K/V tensor.
+                        start = (tp_rank // num_kv_replicas) * num_kv_heads * head_size
+                        size = num_kv_heads * head_size
+                    return full_bf16.narrow(0, start, size)
+
+                def _merged_col_rank_slice(module, idx, full_bf16):
+                    """Slice full gate/up to this TP rank's portion."""
+                    tp_rank = getattr(module, 'tp_rank', 0)
+                    tp_size = getattr(module, 'tp_size', 1)
+                    full_dim = module.output_sizes[idx]  # total across TP ranks
+                    size = full_dim // tp_size
+                    start = tp_rank * size
+                    return full_bf16.narrow(0, start, size)
+
+                def _generic_rank_slice(module, param, full_bf16):
+                    """Slice non-stacked FP8 param to per-TP-rank portion.
+                    Detects column- vs row-parallel by comparing shapes."""
+                    tp_size = getattr(module, 'tp_size', 1)
+                    tp_rank = getattr(module, 'tp_rank', 0)
+                    if tp_size == 1:
+                        return full_bf16
+                    if full_bf16.shape == param.shape:
+                        return full_bf16  # replicated (e.g. tied lm_head)
+                    if (param.shape[0] * tp_size == full_bf16.shape[0]
+                            and param.shape[1] == full_bf16.shape[1]):
+                        # column-parallel: shard on dim 0 (output)
+                        size = full_bf16.size(0) // tp_size
+                        return full_bf16.narrow(0, tp_rank * size, size)
+                    if (param.shape[1] * tp_size == full_bf16.shape[1]
+                            and param.shape[0] == full_bf16.shape[0]):
+                        # row-parallel: shard on dim 1 (input)
+                        size = full_bf16.size(1) // tp_size
+                        return full_bf16.narrow(1, tp_rank * size, size)
+                    raise RuntimeError(
+                        f"Cannot determine TP slice for FP8 param: "
+                        f"full={tuple(full_bf16.shape)}, param={tuple(param.shape)}, tp={tp_size}"
+                    )
+
                 for mname, module in model.named_modules():
                     if not (hasattr(module, 'quant_method') and isinstance(module.quant_method, Fp8LinearMethod)):
                         continue
@@ -310,7 +366,13 @@ class WorkerWrap:
                                 continue
                             src_name = mname.replace(param_name, weight_name) + ".weight"
                             if src_name in weight_index:
-                                shard_list.append(weight_index[src_name])
+                                full_bf16_component = weight_index[src_name]
+                                # Slice this component to per-TP-rank portion
+                                if param_name == "qkv_proj":
+                                    sliced = _qkv_rank_slice(module, weight_name, full_bf16_component)
+                                else:  # gate_up_proj
+                                    sliced = _merged_col_rank_slice(module, shard_id, full_bf16_component)
+                                shard_list.append(sliced)
                         if shard_list:
                             full_bf16 = torch.cat(shard_list, dim=0).to(
                                 device=device, dtype=torch.bfloat16, non_blocking=True)
@@ -323,7 +385,9 @@ class WorkerWrap:
                     else:
                         src_name = mname + ".weight"
                         if src_name in weight_index:
-                            bf16_w = weight_index[src_name].to(
+                            full_src = weight_index[src_name]
+                            sliced = _generic_rank_slice(module, param, full_src)
+                            bf16_w = sliced.to(
                                 device=device, dtype=torch.bfloat16, non_blocking=True)
                             torch.cuda.current_stream().synchronize()
                             fp8_w, scale = scaled_fp8_quant(bf16_w)
@@ -332,13 +396,42 @@ class WorkerWrap:
                                 module.weight_scale.data.copy_(scale.squeeze())
                             del bf16_w, fp8_w, scale
 
-                # Load non-FP8 params (layernorms, embeddings)
+                # Load non-FP8 params (layernorms, embeddings, lm_head).
+                # Embeddings / lm_head may be vocab-parallel sharded; layernorms
+                # are replicated. Slice by comparing shapes — fall back to
+                # vLLM's global TP rank/size when module attrs aren't present
+                # (VocabParallelEmbedding uses different attribute names).
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+                _global_tp_size = get_tensor_model_parallel_world_size()
+                _global_tp_rank = get_tensor_model_parallel_rank()
                 params_dict = dict(model.named_parameters())
+                mods_dict = dict(model.named_modules())
                 for name, tensor in self._accumulated_weights:
                     if name in params_dict:
                         param = params_dict[name]
                         if param.dtype != torch.float8_e4m3fn:
-                            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+                            src = tensor
+                            if src.shape != param.shape:
+                                mod_name = ".".join(name.split(".")[:-1])
+                                mod = mods_dict.get(mod_name)
+                                tp_size = getattr(mod, 'tp_size', None) if mod else None
+                                tp_rank = getattr(mod, 'tp_rank', None) if mod else None
+                                if tp_size is None or tp_rank is None:
+                                    tp_size = _global_tp_size
+                                    tp_rank = _global_tp_rank
+                                if tp_size > 1:
+                                    if (param.shape[0] * tp_size == src.shape[0]
+                                            and (param.dim() == 1 or param.shape[1:] == src.shape[1:])):
+                                        size = src.size(0) // tp_size
+                                        src = src.narrow(0, tp_rank * size, size)
+                                    elif (param.dim() == 2 and param.shape[0] == src.shape[0]
+                                          and param.shape[1] * tp_size == src.shape[1]):
+                                        size = src.size(1) // tp_size
+                                        src = src.narrow(1, tp_rank * size, size)
+                            param.data.copy_(src.to(device=param.device, dtype=param.dtype))
 
                 del weight_index
 

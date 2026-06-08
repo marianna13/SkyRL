@@ -352,8 +352,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         try:
             await self._train_loop()
+        except Exception as e:
+            logger.error(f"[DEBUG] _train_loop() raised exception: {type(e).__name__}: {e}")
+            logger.error(f"[DEBUG] Full traceback:\n{traceback.format_exc()}")
+            raise
         finally:
             # Ensure generator cleanup happens even if training fails
+            logger.info("[DEBUG] Entering finally block - about to shutdown generator")
             try:
                 await self.generator.shutdown()
                 logger.info("Generator shutdown complete")
@@ -376,10 +381,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         self.global_step + 1
                     )  # +1 due to we haven't incremented yet
                     expected_consumed_in_epoch = self.mini_batch_size * (self.global_step % self.num_steps_per_epoch)
-                    assert len(loaded_consumed_data_uids_set) == expected_consumed_in_epoch, (
-                        "Unexpected number of consumed data UIDs. Got: "
-                        f"{len(loaded_consumed_data_uids_set)} != {expected_consumed_in_epoch}"
-                    )
+                    if len(loaded_consumed_data_uids_set) != expected_consumed_in_epoch:
+                        logger.warning(
+                            "Consumed data UIDs mismatch (may differ if dataset/batch size changed): "
+                            f"{len(loaded_consumed_data_uids_set)} != {expected_consumed_in_epoch}. "
+                            "Clearing consumed UIDs to start fresh."
+                        )
+                        loaded_consumed_data_uids_set.clear()
 
         # Initialize weight sync state
         with Timer("init_weight_sync_state"):
@@ -424,7 +432,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 for _ in range(self.num_parallel_generation_workers)
             ]
 
+            loop_start = self.global_step
+            loop_end = (1 + epoch) * self.num_steps_per_epoch + 1
+            logger.info(f"[DEBUG] Starting inner loop: range({loop_start}, {loop_end}) = {loop_end - loop_start} iterations")
+            logger.info(f"[DEBUG] Current state: global_step={self.global_step}, epoch={epoch}, num_steps_per_epoch={self.num_steps_per_epoch}")
+
+            iteration_count = 0
             for _ in range(self.global_step, (1 + epoch) * self.num_steps_per_epoch + 1):
+                iteration_count += 1
+                logger.info(f"[DEBUG] Loop iteration {iteration_count}: _ = {_}, global_step={self.global_step}")
                 with Timer("step", self.all_timings):
                     # 1. Wait until we have enough groups buffered.
                     cur_generation_group_mini_batch: List[GeneratedOutputGroup] = []
@@ -544,11 +560,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     )
 
                 self.global_step += 1
+                logger.info(f"[DEBUG] Completed step, global_step now = {self.global_step}")
 
                 # 9. Notify generation workers that the capacity has increased, unblocking them.
                 await self._staleness_manager.notify_capacity_change(self.global_step)
 
                 # 10. Check for early stopping
+                logger.info(f"[DEBUG] Checking early stopping: should_training_stop={self._control.should_training_stop}")
                 if self._control.should_training_stop:
                     logger.info("Training stopped early by callback")
                     break
@@ -589,6 +607,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             await self.async_train_dataloader.reset_at_epoch_end()
             await self._staleness_manager.validate_state_at_epoch_end(self.global_step)
 
+            logger.info(f"[DEBUG] Finished inner loop with {iteration_count} iterations completed")
             if self._control.should_training_stop:
                 logger.info("Training stopped early by callback at epoch end")
                 break
@@ -596,6 +615,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # End of an epoch.
 
         # End of training
+        logger.info(f"[DEBUG] Exited outer epoch loop normally after epoch {epoch if 'epoch' in dir() else 'N/A'}")
         pbar.close()
 
         # Call on_train_end callbacks

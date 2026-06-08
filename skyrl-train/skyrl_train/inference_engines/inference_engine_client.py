@@ -325,6 +325,11 @@ class InferenceEngineClient(InferenceEngineInterface):
                 {"json": cur_request_json, "headers": headers}
             )
 
+            # 1.2.1. Check if the response is an error (no 'choices' key).
+            if "error" in partial_response or partial_response.get("object", "") == "error":
+                # Return the error response directly instead of trying to parse 'choices'.
+                return partial_response
+
             # 1.3. Parse partial response and in-place update accumulators.
             finish_reason, stop_reason, response_role, aborted_without_generating = (
                 _parse_partial_response_and_inplace_update_accum(
@@ -504,8 +509,46 @@ class InferenceEngineClient(InferenceEngineInterface):
             rank_offset_count += engine.tp_size() * engine.pp_size()
         await asyncio.gather(*tasks)
 
+    async def init_weight_update_communicator_for_engine(
+        self,
+        engine_idx: int,
+        master_addr,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        override_existing: bool = False,
+    ):
+        """Init the weight-update process group for a single engine.
+
+        Counterpart to `init_weight_update_communicator`, but targets one engine.
+        The caller (trainer rank 0) is expected to issue its own
+        `init_custom_process_group(rank=0, world_size=engine_ranks+1)` in lockstep
+        so the rendezvous on this engine's TCPStore completes.
+
+        Used by the SKYRL_PER_ENGINE_WEIGHT_SYNC path to avoid one giant
+        (N_engines * tp * pp * dp) + 1 NCCL group that hangs at scale.
+        """
+        engine = self.engines[engine_idx]
+        return await engine.init_weight_update_communicator(
+            master_addr=master_addr,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+            override_existing=override_existing,
+        )
+
     async def update_named_weights(self, request: NamedWeightsUpdateRequest):
         return await self._run_on_all_engines("update_named_weights", request=request)
+
+    async def begin_weight_update(self):
+        return await self._run_on_all_engines("begin_weight_update")
+
+    async def end_weight_update(self):
+        return await self._run_on_all_engines("end_weight_update")
 
     async def reset_prefix_cache(self):
         return await self._run_on_all_engines("reset_prefix_cache")

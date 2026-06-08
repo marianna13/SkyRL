@@ -569,8 +569,9 @@ def ppo_policy_loss(
     assert loss_reduction in [
         "token_mean",
         "sequence_mean",
+        "seq_mean_token_sum",
         "seq_mean_token_sum_norm",
-    ], "loss_reduction must be either 'token_mean', 'sequence_mean', or 'seq_mean_token_sum_norm'"
+    ], "loss_reduction must be one of 'token_mean', 'sequence_mean', 'seq_mean_token_sum', 'seq_mean_token_sum_norm'"
 
     ratio = _safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
     surr1 = ratio * advantages
@@ -883,7 +884,9 @@ def compute_policy_loss_kl_cov(
 def reduce_loss(
     loss: torch.Tensor,
     loss_mask: Optional[torch.Tensor],
-    loss_reduction: Literal["token_mean", "sequence_mean", "seq_mean_token_sum_norm"],
+    loss_reduction: Literal[
+        "token_mean", "sequence_mean", "seq_mean_token_sum", "seq_mean_token_sum_norm"
+    ],
     max_seq_len: Optional[int] = None,
 ) -> torch.Tensor:
     if loss_reduction == "token_mean":
@@ -892,6 +895,17 @@ def reduce_loss(
     elif loss_reduction == "sequence_mean":
         # per-sequence token-mean (dim=-1), then batch-mean
         loss = masked_mean(loss, loss_mask, dim=-1).mean()
+    elif loss_reduction == "seq_mean_token_sum":
+        # per-sequence token-sum, then batch-mean. NO length normalization.
+        # Exact match for verl's `seq-mean-token-sum` (the original DeepSWE
+        # recipe). Differs from seq_mean_token_sum_norm only by the absence of
+        # the /max_seq_len constant — which otherwise suppresses grad_norm by
+        # ~max_seq_len / avg_seq_len (≈6x for DeepSWE), stalling learning.
+        if loss_mask is not None:
+            seq_losses = torch.sum(loss * loss_mask, dim=-1)
+        else:
+            seq_losses = torch.sum(loss, dim=-1)
+        loss = torch.mean(seq_losses)
     elif loss_reduction == "seq_mean_token_sum_norm":
         # per-sequence token-sum, normalized by the max sequence length, then batch mean
         # this is the Dr. GRPO loss reduction to avoid length bias by normalizing by a constant

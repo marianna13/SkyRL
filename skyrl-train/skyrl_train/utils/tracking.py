@@ -75,6 +75,10 @@ class Tracking:
                     current_node_ip = ray.util.get_node_ip_address()
                 except Exception as e:
                     logger.warning(f"Failed to get node IP address, defaulting to 'head'. Error: {e}")
+                
+            import os
+
+            print(f"Wandb mode: {os.environ.get('WANDB_MODE', 'not set')}")
 
             run = wandb.init(
                 project=project_name,

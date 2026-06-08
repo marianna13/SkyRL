@@ -266,9 +266,6 @@ class Worker(DistributedTorchRayActor):
 
         if torch.distributed.get_rank() == 0:
             master_addr = ray._private.services.get_node_ip_address()
-            with socket.socket() as sock:
-                sock.bind(("", 0))
-                master_port = sock.getsockname()[1]
 
             num_inference_engines, tensor_parallel_size, pipeline_parallel_size, data_parallel_size = (
                 self.cfg.generator.num_inference_engines,
@@ -276,39 +273,104 @@ class Worker(DistributedTorchRayActor):
                 self.cfg.generator.inference_engine_pipeline_parallel_size,
                 self.cfg.generator.inference_engine_data_parallel_size,
             )
-            world_size = num_inference_engines * tensor_parallel_size * pipeline_parallel_size * data_parallel_size + 1
-
             backend = self.cfg.generator.weight_sync_backend
-
             override_existing = False if self.cfg.generator.override_existing_update_group == "disable" else True
-            group_name = "skyrl"
-            self._model_update_group_name = group_name
 
-            tasks = []
-            tasks.append(
-                inference_engine_client.init_weight_update_communicator(
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    rank_offset=1,
-                    world_size=world_size,
-                    group_name=group_name,
-                    backend=backend,
-                    override_existing=override_existing,
-                )
-            )
+            # Opt-in: build one weight-update process group per inference engine,
+            # sequentially, instead of one giant (N_engines*tp*pp*dp)+1 group.
+            # The big group rendezvous via TCPStore on rank 0 stalls at 8+ nodes
+            # with colocate_all. Per-engine groups keep each rendezvous to
+            # (tp*pp*dp)+1 ranks. Default path is unchanged when the flag is off.
+            per_engine = os.environ.get("SKYRL_PER_ENGINE_WEIGHT_SYNC", "0") == "1"
 
-            tasks.append(
-                asyncio.to_thread(
-                    init_custom_process_group,
-                    backend=backend,
-                    init_method=get_tcp_url(master_addr, master_port),
-                    world_size=world_size,
-                    rank=0,
-                    group_name=group_name,
+            if per_engine:
+                # The per-engine path only wires up the IPC weight-sync route
+                # (colocate_all + nccl). Non-IPC broadcast would need to iterate
+                # groups in fsdp_worker.broadcast_to_inference_engines, which we
+                # haven't rewritten — fail loudly instead of silently breaking.
+                assert self.cfg.trainer.placement.colocate_all and backend == "nccl", (
+                    "SKYRL_PER_ENGINE_WEIGHT_SYNC=1 requires "
+                    "trainer.placement.colocate_all=true and "
+                    "generator.weight_sync_backend=nccl (CUDA IPC path). "
+                    f"Got colocate_all={self.cfg.trainer.placement.colocate_all}, "
+                    f"backend={backend}."
                 )
-            )
-            results = await asyncio.gather(*tasks)
-            self._model_update_group = results[-1]
+                per_engine_world = (
+                    tensor_parallel_size * pipeline_parallel_size * data_parallel_size + 1
+                )
+                self._model_update_group_name = []
+                self._model_update_group = []
+                logger.info(
+                    f"[per-engine weight sync] building {num_inference_engines} groups "
+                    f"of world_size={per_engine_world} sequentially"
+                )
+                for engine_idx in range(num_inference_engines):
+                    with socket.socket() as sock:
+                        sock.bind(("", 0))
+                        master_port = sock.getsockname()[1]
+                    group_name = f"skyrl_engine_{engine_idx}"
+                    self._model_update_group_name.append(group_name)
+
+                    engine_init = inference_engine_client.init_weight_update_communicator_for_engine(
+                        engine_idx=engine_idx,
+                        master_addr=master_addr,
+                        master_port=master_port,
+                        rank_offset=1,
+                        world_size=per_engine_world,
+                        group_name=group_name,
+                        backend=backend,
+                        override_existing=override_existing,
+                    )
+                    trainer_init = asyncio.to_thread(
+                        init_custom_process_group,
+                        backend=backend,
+                        init_method=get_tcp_url(master_addr, master_port),
+                        world_size=per_engine_world,
+                        rank=0,
+                        group_name=group_name,
+                    )
+                    results = await asyncio.gather(engine_init, trainer_init)
+                    self._model_update_group.append(results[-1])
+                    logger.info(
+                        f"[per-engine weight sync] engine {engine_idx}/{num_inference_engines} "
+                        f"group {group_name!r} up"
+                    )
+            else:
+                with socket.socket() as sock:
+                    sock.bind(("", 0))
+                    master_port = sock.getsockname()[1]
+
+                world_size = (
+                    num_inference_engines * tensor_parallel_size * pipeline_parallel_size * data_parallel_size + 1
+                )
+                group_name = "skyrl"
+                self._model_update_group_name = group_name
+
+                tasks = []
+                tasks.append(
+                    inference_engine_client.init_weight_update_communicator(
+                        master_addr=master_addr,
+                        master_port=master_port,
+                        rank_offset=1,
+                        world_size=world_size,
+                        group_name=group_name,
+                        backend=backend,
+                        override_existing=override_existing,
+                    )
+                )
+
+                tasks.append(
+                    asyncio.to_thread(
+                        init_custom_process_group,
+                        backend=backend,
+                        init_method=get_tcp_url(master_addr, master_port),
+                        world_size=world_size,
+                        rank=0,
+                        group_name=group_name,
+                    )
+                )
+                results = await asyncio.gather(*tasks)
+                self._model_update_group = results[-1]
 
             # # Register signal handlers for termination only on rank 0
             # NOTE (sumanthrh): This doesn't work yet, and is thus commented out.
@@ -502,6 +564,27 @@ class PPORayActorGroup:
                         record_memory=self.record_memory,
                     )
                 self._actor_handlers.append(worker_actor)
+                # Batched sequential-init: force-materialize every Nth actor so
+                # Ray's scheduler doesn't backlog at large world sizes. Without
+                # this, .remote() returns ActorHandles immediately but the
+                # actual actor processes never instantiate beyond ~16-20 at a
+                # time on overloaded GCS, and the subsequent
+                # init_worker_process_group barrier hangs forever waiting for
+                # the missing actors. ray.get on a light RPC blocks until each
+                # actor in the batch is alive on the cluster.
+                _BATCH = int(os.environ.get("SKYRL_ACTOR_SPAWN_BATCH", "8"))
+                if rank % _BATCH == 0 and rank > 0:
+                    ray.get(
+                        [h.get_master_addr_port.remote()
+                         for h in self._actor_handlers[-_BATCH:]]
+                    )
+            # Final flush for any actors past the last batch boundary
+            _tail = (world_size - 1) % _BATCH if 'world_size' in dir() else 0
+            if _tail:
+                ray.get(
+                    [h.get_master_addr_port.remote()
+                     for h in self._actor_handlers[-_tail:]]
+                )
 
         # Initialize process group
         logger.info("Initializing process group for RayActorGroup")

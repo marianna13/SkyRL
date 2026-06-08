@@ -550,7 +550,9 @@ class PassRatioShaper(RewardShaper):
         parsed: ParsedTestResult,
         original_reward: float,
     ) -> float:
-        """Return simple pass ratio."""
+        """Return simple pass ratio, falling back to original_reward for single-test tasks."""
+        if parsed.total <= 1:
+            return original_reward
         return parsed.pass_ratio
 
 
