@@ -14,6 +14,23 @@ from skyrl_train.fully_async_trainer import FullyAsyncRayPPOTrainer
 from skyrl_train.trainer import RayPPOTrainer
 
 class TerminalBenchExp(BasePPOExp):
+    def _setup_trainer(self):
+        trainer = super()._setup_trainer()
+        # Only register Beam cleanup callback when using the Beam environment
+        tb_cfg = self.cfg.terminal_bench_config
+        env_type = tb_cfg.get("environment_type") or tb_cfg.get("harbor", {}).get("environment_type")
+        if env_type == "beam":
+            from examples.terminal_bench.beam_cleanup_callback import BeamEpochCleanupCallback
+            trainer.callback_handler.add_callback(BeamEpochCleanupCallback())
+
+        # Pass all dataset task paths to the generator for image pre-building.
+        # This allows startup() to pre-build all unique Docker images at once
+        # (before any generate() calls), avoiding a build stampede on the cluster.
+        if hasattr(trainer.generator, "set_task_paths") and hasattr(self.train_dataset, "get_task_paths"):
+            trainer.generator.set_task_paths(self.train_dataset.get_task_paths())
+
+        return trainer
+
     def get_generator(self, cfg, tokenizer, inference_engine_client):
         """
         Initializes the TerminalBenchGenerator.

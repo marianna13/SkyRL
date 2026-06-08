@@ -100,10 +100,19 @@ AGENT_SCHEMA = SectionSchema(
         # This prevents reward hacking where the model produces garbage output that the
         # parser auto-corrects, allowing the model to get rewards despite malformed responses.
         "strict_json_parser": FieldMapping("strict_json_parser", field_type="kwargs", default=False),
+        # Shell recovery control
+        # When false, disables automatic recovery from stuck shell states (>, dquote>, etc.)
+        # Disabled for RL training to prevent recovery keystrokes (", ', Ctrl-C) from
+        # contaminating training data. The model should learn not to break the shell.
+        "enable_shell_recovery": FieldMapping("enable_shell_recovery", field_type="kwargs", default=True),
         # Episode logging control
         # When false, disables creation of episode-* folders with debug.json, prompt.txt, response.txt
         # This reduces disk I/O for RL training where SkyRL uses TrialResult directly
         "enable_episode_logging": FieldMapping("enable_episode_logging", field_type="kwargs", default=True),
+        # Terminal recording via asciinema
+        # Disabled by default for RL training - containers often lack pip/internet access,
+        # causing 8 failed pip install attempts per trial and unnecessary log spam
+        "record_terminal_session": FieldMapping("record_terminal_session", field_type="kwargs", default=False),
     }
 )
 
@@ -125,6 +134,15 @@ ENVIRONMENT_SCHEMA = SectionSchema(
         "override_storage_mb": FieldMapping("override_storage_mb"),
         "override_gpus": FieldMapping("override_gpus"),
         "environment_type": FieldMapping("type"),  # Maps to EnvironmentConfig.type
+        "environment_import_path": FieldMapping("import_path"),  # Custom environment class
+        # Daytona-specific: auto-create snapshots based on Dockerfile hash
+        "auto_snapshot": FieldMapping("auto_snapshot", field_type="kwargs", default=False),
+        # Bridge-apptainer-specific: bridge URL and SIF cache
+        "bridge_url": FieldMapping("bridge_url", field_type="kwargs"),
+        "sif_cache": FieldMapping("sif_cache", field_type="kwargs"),
+        # kube_pool-specific: pool size per (task, dockerfile_hash). Should equal
+        # n_samples_per_prompt so each rollout of one prompt gets its own pod.
+        "replicas": FieldMapping("replicas", field_type="kwargs"),
     }
 )
 
@@ -164,6 +182,18 @@ ORCHESTRATOR_SCHEMA = SectionSchema(
     }
 )
 
+# Pre-build config fields (for warming image cache before generation starts)
+PRE_BUILD_SCHEMA = SectionSchema(
+    fields={
+        # Enable pre-building Docker images before sandbox creation
+        # When true, builds all unique images with limited concurrency on the first
+        # generate() call, avoiding a stampede of concurrent builds
+        "pre_build_images": FieldMapping("pre_build_images", default=False),
+        # Max concurrent image builds during pre-build phase (lower = gentler on cluster)
+        "pre_build_max_concurrent": FieldMapping("pre_build_max_concurrent", default=8),
+    }
+)
+
 # Logging config fields
 LOGGING_SCHEMA = SectionSchema(
     fields={
@@ -183,6 +213,11 @@ REWARD_SHAPING_SCHEMA = SectionSchema(
         "enable_reward_shaping": FieldMapping("enable_reward_shaping", default=True),
         # Fallback to original reward if parsing fails
         "reward_shaping_fallback": FieldMapping("reward_shaping_fallback", default=True),
+        # Mask loss for truncated trajectories (stop_reason="length")
+        # When True, trajectories that hit max context length get loss_mask=0,
+        # preventing them from contributing to the policy gradient.
+        # This avoids training on incomplete rollouts that may teach bad behaviors.
+        "mask_truncated_loss": FieldMapping("mask_truncated_loss", default=False),
         # Threshold shaper params
         "reward_threshold": FieldMapping("reward_threshold", default=1.0),
         "below_threshold_scale": FieldMapping("below_threshold_scale", default=0.5),
@@ -234,6 +269,7 @@ HARBOR_SCHEMA = {
     "trial": TRIAL_SCHEMA,
     "retry": RETRY_SCHEMA,
     "orchestrator": ORCHESTRATOR_SCHEMA,
+    "pre_build": PRE_BUILD_SCHEMA,
     "logging": LOGGING_SCHEMA,
     "reward_shaping": REWARD_SHAPING_SCHEMA,
     "error_handling": ERROR_HANDLING_SCHEMA,
@@ -387,19 +423,29 @@ class HarborConfigBuilder:
     def _build_environment_config(self) -> EnvironmentConfig:
         """Build EnvironmentConfig from config."""
         env_fields = {}
+        env_kwargs = {}
 
         for yaml_key, mapping in ENVIRONMENT_SCHEMA.fields.items():
             value = self._get_field_value(yaml_key, mapping, self._cfg)
             if value is not None:
-                if mapping.harbor_field == "type":
+                if mapping.field_type == "kwargs":
+                    # Kwargs fields go to the kwargs dict (passed to environment constructor)
+                    env_kwargs[mapping.harbor_field] = value
+                elif mapping.harbor_field == "type":
                     # Special handling for environment type
                     if isinstance(value, str):
                         value = EnvironmentType(value)
-                env_fields[mapping.harbor_field] = value
+                    env_fields[mapping.harbor_field] = value
+                else:
+                    env_fields[mapping.harbor_field] = value
 
-        # Default to Daytona if not specified
-        if "type" not in env_fields:
+        # Default to Daytona if not specified (unless import_path is set)
+        if "type" not in env_fields and "import_path" not in env_fields:
             env_fields["type"] = EnvironmentType.DAYTONA
+
+        # Add kwargs if any
+        if env_kwargs:
+            env_fields["kwargs"] = env_kwargs
 
         return EnvironmentConfig(**env_fields)
 
@@ -546,6 +592,33 @@ class HarborConfigBuilder:
 
         return config
 
+    def get_pre_build_images(self) -> bool:
+        """Whether to pre-build Docker images before generation starts."""
+        mapping = PRE_BUILD_SCHEMA.fields.get("pre_build_images")
+        if mapping:
+            value = self._get_field_value("pre_build_images", mapping, self._cfg)
+            if value is not None:
+                return bool(value)
+        return False
+
+    def get_pre_build_max_concurrent(self, default: int = 8) -> int:
+        """Max concurrent image builds during pre-build phase."""
+        mapping = PRE_BUILD_SCHEMA.fields.get("pre_build_max_concurrent")
+        if mapping:
+            value = self._get_field_value("pre_build_max_concurrent", mapping, self._cfg)
+            if value is not None:
+                return int(value)
+        return default
+
+    def get_environment_type(self, default: str = "daytona") -> str:
+        """Get the configured environment type (e.g., 'beam', 'daytona')."""
+        mapping = ENVIRONMENT_SCHEMA.fields.get("environment_type")
+        if mapping:
+            value = self._get_field_value("environment_type", mapping, self._cfg)
+            if value is not None:
+                return str(value)
+        return default
+
     def get_eval_timeout_override_sec(self, default: int = 900) -> int:
         """
         Get the timeout override for evaluation runs.
@@ -593,6 +666,7 @@ class HarborConfigBuilder:
         """
         # Build component configs
         environment_config = self._build_environment_config()
+
         verifier_config = self._build_verifier_config()
         agent_direct_fields, agent_kwargs = self._build_agent_fields()
         trial_fields = self._get_trial_fields()
