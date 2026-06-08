@@ -238,6 +238,46 @@ class MegatronModelWrapper:
 
             action_log_probs = token_logprobs[:, -num_actions:]
 
+            import os as _osgd
+            if _osgd.environ.get("GRAD_DEBUG") == "1":
+                try:
+                    # Check the model instance that was just called: does it actually
+                    # contain LoRA adapter modules with requires_grad=True params?
+                    _mods = self.actor_module if isinstance(self.actor_module, (list, tuple)) else [self.actor_module]
+                    _lora_count = 0
+                    _lora_rg_count = 0
+                    _sample_lora_names = []
+                    for _m in _mods:
+                        _u = _m
+                        _seen_u = set()
+                        while hasattr(_u, "module") and id(_u) not in _seen_u:
+                            _seen_u.add(id(_u))
+                            _u = _u.module
+                        for _pn, _pp in _u.named_parameters():
+                            if (".adapter." in _pn) or (".lora_" in _pn.lower()):
+                                _lora_count += 1
+                                if _pp.requires_grad:
+                                    _lora_rg_count += 1
+                                if len(_sample_lora_names) < 2:
+                                    _sample_lora_names.append(
+                                        (_pn, tuple(_pp.shape), bool(_pp.requires_grad))
+                                    )
+                    print(
+                        f"[GRAD_DEBUG_FWD] logits.requires_grad={logits.requires_grad} "
+                        f"logits.grad_fn={type(logits.grad_fn).__name__ if logits.grad_fn is not None else None} "
+                        f"token_logprobs.requires_grad={token_logprobs.requires_grad} "
+                        f"action_log_probs.requires_grad={action_log_probs.requires_grad} "
+                        f"torch.is_grad_enabled={torch.is_grad_enabled()} "
+                        f"torch.is_inference_mode_enabled={torch.is_inference_mode_enabled() if hasattr(torch, 'is_inference_mode_enabled') else 'N/A'} "
+                        f"actor_module_lora_params={_lora_count} lora_requires_grad_true={_lora_rg_count} "
+                        f"sample_lora_in_actor={_sample_lora_names} "
+                        f"actor_training={getattr(_mods[0], 'training', None)}",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    import traceback as _tb
+                    print(f"[GRAD_DEBUG_FWD] err: {_e}\n{_tb.format_exc()}", flush=True)
+
             # policy loss should be calculated based on the selected token logprobs
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
@@ -310,11 +350,66 @@ class MegatronModelWrapper:
 
             loss = policy_loss + kl_loss_term - entropy_loss_term
 
+            import os as _os
+            if _os.environ.get("GRAD_DEBUG") == "1":
+                try:
+                    _pl = float(policy_loss.detach().item())
+                    _kl = float(kl_loss.detach().item()) if hasattr(kl_loss, "item") else float(kl_loss)
+                    _ent = float(entropy.detach().item()) if hasattr(entropy, "item") else float(entropy)
+                    _loss_val = float(loss.detach().item())
+                    _gfn = type(loss.grad_fn).__name__ if loss.grad_fn is not None else None
+                    _requires_grad = bool(loss.requires_grad)
+                    _adv_mean = float(advantages.float().mean().item()) if advantages is not None else None
+                    _adv_max = float(advantages.float().abs().max().item()) if advantages is not None else None
+                    _alp_mean = float(action_log_probs.detach().mean().item())
+                    _olp_mean = float(old_action_log_probs.mean().item()) if old_action_log_probs is not None else None
+                    _lm_sum = int(loss_mask.sum().item()) if loss_mask is not None else -1
+                    _lm_numel = int(loss_mask.numel()) if loss_mask is not None else -1
+                    print(
+                        f"[GRAD_DEBUG_LOSS] policy_loss={_pl:.6e} kl={_kl:.6e} ent={_ent:.6e} "
+                        f"total_loss={_loss_val:.6e} loss.requires_grad={_requires_grad} "
+                        f"loss.grad_fn={_gfn} adv_mean={_adv_mean} adv_abs_max={_adv_max} "
+                        f"action_logprob_mean={_alp_mean} old_logprob_mean={_olp_mean} "
+                        f"loss_mask_sum={_lm_sum}/{_lm_numel}",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    import traceback as _tb
+                    print(f"[GRAD_DEBUG_LOSS] err: {_e}\n{_tb.format_exc()}", flush=True)
+
+            # Build per-sequence loss_fn_outputs (same schema the SFT path uses above)
+            # so the tinker backend (skyrl_train.py) can populate its per-request
+            # response without a KeyError. Values are detached + no_grad — pure
+            # telemetry, doesn't affect training.
+            with torch.no_grad():
+                _elementwise_loss_rl = -action_log_probs
+                if loss_mask is not None:
+                    _elementwise_loss_rl = _elementwise_loss_rl * loss_mask
+            _bsz = action_log_probs.shape[0]
+            _loss_fn_outputs = []
+            for _i in range(_bsz):
+                if action_mask is not None:
+                    _valid_len = int(action_mask[_i].sum().item())
+                elif loss_mask is not None:
+                    _valid_len = int(loss_mask[_i].sum().item())
+                else:
+                    _valid_len = action_log_probs.shape[1]
+                _start = max(action_log_probs.shape[1] - _valid_len, 0)
+                _loss_fn_outputs.append(
+                    {
+                        "logprobs": action_log_probs[_i, _start:].detach().cpu().tolist(),
+                        "elementwise_loss": _elementwise_loss_rl[_i, _start:].detach().cpu().tolist(),
+                    }
+                )
+
             metrics = {
                 "final_loss": loss.detach().item(),
                 "policy_loss": policy_loss.detach().item(),
                 "policy_entropy": entropy.detach().item(),
                 "policy_kl": kl_loss.detach().item(),
+                "loss": loss.detach().item(),
+                "response_length": num_actions,
+                "loss_fn_outputs": _loss_fn_outputs,
             }
             for k, v in loss_metrics.items():
                 metrics["loss_metrics/" + k] = v
@@ -344,12 +439,29 @@ class MegatronModelWrapper:
                 )
                 packed_seq_params = None
 
+            print(f"[DEBUG] foward_step: use_sample_packing={self.use_sample_packing}, packed_seq_params={packed_seq_params}")
             outputs = model(
                 new_sequences,
                 new_position_ids,
                 new_attention_mask,
                 packed_seq_params=packed_seq_params,
             )
+            import os as _osgdmo
+            if _osgdmo.environ.get("GRAD_DEBUG") == "1":
+                try:
+                    _g = getattr(outputs, "grad_fn", None)
+                    _gname = type(_g).__name__ if _g is not None else None
+                    _rg = getattr(outputs, "requires_grad", None)
+                    _shape = tuple(outputs.shape) if hasattr(outputs, "shape") else None
+                    _is_pp_last = mpu.is_pipeline_last_stage(ignore_virtual=True)
+                    print(
+                        f"[GRAD_DEBUG_MODEL_OUT] outputs.grad_fn={_gname} "
+                        f"requires_grad={_rg} shape={_shape} pp_last_stage={_is_pp_last}",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    import traceback as _tb
+                    print(f"[GRAD_DEBUG_MODEL_OUT] err: {_e}\n{_tb.format_exc()}", flush=True)
 
             if self.use_sample_packing:
                 outputs = postprocess_packed_seqs(

@@ -11,16 +11,39 @@ import vllm
 from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-    CompletionRequest,
-    CompletionResponse,
-)
+# vllm <0.18 had flat modules under entrypoints.openai; 0.18 moved them into subpackages
+try:
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+except ImportError:
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+try:
+    from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+except ImportError:
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+try:
+    from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+except ImportError:
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+    from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+# vllm 0.18 moved protocol classes into per-subpackage protocol.py modules
+try:
+    from vllm.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ErrorResponse,
+        CompletionRequest,
+        CompletionResponse,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.entrypoints.openai.completion.protocol import (
+        CompletionRequest,
+        CompletionResponse,
+    )
+    from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.lora.request import LoRARequest
 from uuid import uuid4
 from skyrl_train.inference_engines.base import (
@@ -331,6 +354,34 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             models = OpenAIServingModels(engine, model_config, base_model_paths)
             legacy_kwargs["model_config"] = model_config
 
+        # vllm >= 0.18 requires a separate OpenAIServingRender object for chat-template /
+        # tool-parser concerns. Detect by signature so older vllm versions stay unchanged.
+        import inspect as _inspect
+        _chat_sig = _inspect.signature(OpenAIServingChat.__init__)
+        _needs_render = "openai_serving_render" in _chat_sig.parameters
+
+        _chat_template = openai_kwargs.pop("chat_template", None)
+        if _needs_render:
+            from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+            from vllm.renderers import renderer_from_config
+            from vllm.plugins.io_processors import get_io_processor
+
+            _vllm_config = engine.vllm_config
+            _renderer = renderer_from_config(_vllm_config)
+            _io_processor = get_io_processor(
+                _vllm_config, _renderer, _vllm_config.model_config.io_processor_plugin
+            )
+            self.openai_serving_render = OpenAIServingRender(
+                model_config=_vllm_config.model_config,
+                renderer=_renderer,
+                io_processor=_io_processor,
+                model_registry=models,
+                request_logger=None,
+                chat_template=_chat_template,
+                chat_template_content_format="auto",
+            )
+            legacy_kwargs["openai_serving_render"] = self.openai_serving_render
+
         # TODO(Charlie): revisit kwargs `enable_auto_tools` and `tool_parser` when we need to
         # support OAI-style tool calling; and `request_logger` for better debugging.
         self.openai_serving_chat = OpenAIServingChat(
@@ -338,7 +389,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             models=models,
             response_role="assistant",
             request_logger=None,
-            chat_template=openai_kwargs.pop("chat_template", None),  # used to template /chat/completions requests
+            chat_template=_chat_template,  # used to template /chat/completions requests
             chat_template_content_format="auto",
             **legacy_kwargs,
             **openai_kwargs,
@@ -503,7 +554,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             assert request.stream is False, "Streaming is not supported in SkyRL yet, please set stream to False."
         except Exception as e:
             if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                from vllm.entrypoints.openai.protocol import ErrorInfo
+                try:
+                    from vllm.entrypoints.openai.protocol import ErrorInfo
+                except ImportError:
+                    from vllm.entrypoints.openai.engine.protocol import ErrorInfo
 
                 return ErrorResponse(
                     error=ErrorInfo(
@@ -552,7 +606,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 http_status = HTTPStatus.INTERNAL_SERVER_ERROR
 
             if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                from vllm.entrypoints.openai.protocol import ErrorInfo
+                try:
+                    from vllm.entrypoints.openai.protocol import ErrorInfo
+                except ImportError:
+                    from vllm.entrypoints.openai.engine.protocol import ErrorInfo
 
                 return ErrorResponse(
                     error=ErrorInfo(

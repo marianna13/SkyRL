@@ -153,17 +153,69 @@ def create_ray_wrapped_inference_engines(
         num_gpus_per_actor = 0.2
 
     per_engine_gpu_count = tensor_parallel_size * pipeline_parallel_size * data_parallel_size
+    per_engine_pgs = None
     if not use_hybrid_engine:
-        # Create a big placement group to ensure that all inference engines are packed
-        bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_inference_engines * per_engine_gpu_count)]
-        shared_pg = placement_group(bundles, strategy="PACK")
-        get_ray_pg_ready_with_timeout(shared_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+        # One STRICT_PACK placement group PER engine. STRICT_PACK forces all of
+        # an engine's `per_engine_gpu_count` 1-GPU bundles onto a SINGLE node
+        # (Ray will not split a STRICT_PACK group across nodes), so every
+        # engine's TP/PP/DP ranks are node-local and vLLM's local_rank->CUDA
+        # device mapping is unambiguous.
+        #
+        # The old single flat `placement_group([{GPU:1}]*N, "PACK")` only
+        # minimized node count best-effort. On ray>=2.54 it scattered an
+        # engine's consecutive bundles across nodes; the straddled TP group then
+        # mapped two ranks onto one node's GPU0 -> first NCCL "Duplicate GPU
+        # detected", then (with 1 full GPU/worker) two ~30GB shards on one
+        # 63GB GPU -> CUDA OOM. ray 2.51/vllm 0.11 (Jupiter) happened to keep
+        # them node-local, which is why TP>1 worked there. STRICT_PACK makes
+        # node-locality explicit and ray/vllm-version independent.
+        #
+        # Requires per_engine_gpu_count <= GPUs/node (true for TP*PP*DP <= node
+        # size; a single parallel group bigger than one node must span nodes by
+        # definition and would need a different strategy).
+        per_engine_pgs = [
+            placement_group(
+                [{"GPU": 1, "CPU": 1} for _ in range(per_engine_gpu_count)],
+                strategy="STRICT_PACK",
+            )
+            for _ in range(num_inference_engines)
+        ]
+        import time as _time
+
+        for _pg in per_engine_pgs:
+            get_ray_pg_ready_with_timeout(_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+            # GCS-consistency barrier. pg.ready() only means SCHEDULED; the GCS
+            # `placement_group_table(pg_id)` entry ("bundles") is
+            # eventually-consistent and may not be populated yet. vLLM's
+            # ray_executor reads `current_placement_group.bundle_specs` ->
+            # `placement_group_table(pg_id)["bundles"]` with NO retry, so when
+            # many STRICT_PACK PGs are created at once (one/engine + policy/ref)
+            # a freshly-created PG read too early raises KeyError: 'bundles'
+            # (intermittent / partial-failure). Force that GCS read to succeed
+            # HERE — before any engine actor is created on the PG — so vLLM's
+            # later read (separate process) is guaranteed consistent.
+            _deadline = _time.time() + SKYRL_RAY_PG_TIMEOUT_IN_S
+            while True:
+                try:
+                    _ = _pg.bundle_specs  # -> placement_group_table(pg_id)["bundles"]
+                    break
+                except KeyError:
+                    if _time.time() > _deadline:
+                        raise
+                    _time.sleep(1.0)
 
     for i in range(num_inference_engines):
-        base_pg_index = i * per_engine_gpu_count
+        # Per-engine STRICT_PACK PG -> bundle indices are local (0..peg-1).
+        # Hybrid/shared PG (colocate_all) -> keep the legacy global offset.
+        if per_engine_pgs is not None:
+            engine_pg = per_engine_pgs[i]
+            base_pg_index = 0
+        else:
+            engine_pg = shared_pg
+            base_pg_index = i * per_engine_gpu_count
 
         # Get DP group rendezvous (addr, port) on the same node as DP rank 0 for this engine.
-        data_parallel_address, data_parallel_rpc_port = get_rendezvous_addr_port(shared_pg, base_pg_index)
+        data_parallel_address, data_parallel_rpc_port = get_rendezvous_addr_port(engine_pg, base_pg_index)
 
         if backend == "vllm":
             if async_engine:
@@ -209,7 +261,7 @@ def create_ray_wrapped_inference_engines(
                     list(range(base_dp_pg_index, base_dp_pg_index + tp_pp_size)) if tp_pp_size > 1 else None
                 )
                 dp_rank_sched = PlacementGroupSchedulingStrategy(
-                    placement_group=shared_pg,
+                    placement_group=engine_pg,
                     placement_group_capture_child_tasks=True,
                     placement_group_bundle_index=base_dp_pg_index,
                 )
@@ -264,12 +316,12 @@ def create_ray_wrapped_inference_engines(
 
             bundle_indices = None
             if per_engine_gpu_count > 1:
-                bundle_indices = list(range(i * per_engine_gpu_count, (i + 1) * per_engine_gpu_count))
+                bundle_indices = list(range(base_pg_index, base_pg_index + per_engine_gpu_count))
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=shared_pg,
+                placement_group=engine_pg,
                 placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=i * per_engine_gpu_count,
+                placement_group_bundle_index=base_pg_index,
             )
 
             # NOTE(Charlie): We need `torch.cuda.is_available()` to be True to import SGLang. Otherwise, it requires
@@ -326,7 +378,7 @@ def create_ray_wrapped_inference_engines(
     if inference_engine_enable_sleep:
         if backend == "vllm":
             # NOTE(shu): set to 1 for LoRA
-            sleep_level = 1 if enable_lora else sleep_level
+            # sleep_level = 1 if enable_lora else sleep_level
             sleep_refs = [engine.inference_engine_actor.sleep.remote(level=sleep_level) for engine in engines]
         elif backend == "sglang":
             # NOTE(Charlie): we always need to sync weights after waking up,

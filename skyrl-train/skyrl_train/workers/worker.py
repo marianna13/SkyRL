@@ -442,7 +442,7 @@ class PPORayActorGroup:
                 for i in range(len(bundles)):
                     bundles[i][resources_name] = self._num_resources_per_node
 
-            pg = placement_group(bundles, strategy="PACK")
+            pg = placement_group(bundles, strategy="SPREAD")
             get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
         if pg:
             master_actor = self.ray_actor_type.options(

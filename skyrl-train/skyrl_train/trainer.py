@@ -75,6 +75,7 @@ from skyrl_train.workers.worker_dispatch import WorkerDispatch
 from skyrl_train.workers.worker_utils import reduce_metrics
 
 import asyncio, ray
+import traceback
 
 @ray.remote
 class OffloadGate:
@@ -543,9 +544,16 @@ class RayPPOTrainer:
             self.total_training_steps * critic_steps_per_train_batch if self.total_training_steps is not None else None
         )
         if not cfg.trainer.placement.colocate_all:
-            refs = []
             if ref_model is not None:
-                ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
+                try:
+                    ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
+                except Exception as e:
+                    print(f"Error initializing ref model: {e}")
+                    traceback.print_exc()
+                    raise e
+                if cfg.trainer.placement.colocate_policy_ref:
+                    logger.info("Offloading reference model to CPU after initial build")
+                    ref_model.offload_to_cpu()
 
             ray.get(gate.acquire.remote())
             try:
@@ -568,7 +576,11 @@ class RayPPOTrainer:
             ray.get(policy_model.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
         else:
             if ref_model is not None:
-                ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
+                try:
+                    ray.get(ref_model.async_init_model(cfg.trainer.ref.model.path))
+                except Exception as e:
+                    print(f"Error initializing ref model: {e}")
+                    raise e
                 try:
                     ref_model.offload_to_cpu()
                 except Exception as e:

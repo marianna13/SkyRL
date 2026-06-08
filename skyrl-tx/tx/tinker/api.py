@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
         db_url, 
         echo=False,
         poolclass=NullPool,
-        connect_args={"timeout": 30},  # seconds
+        connect_args={"timeout": 300},  # seconds
     )
 
 
@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.execute("PRAGMA busy_timeout=30000;")  # ms
+        cursor.execute("PRAGMA busy_timeout=300000;")  # 5 min
         cursor.close()
 
     app.state.db_engine = engine

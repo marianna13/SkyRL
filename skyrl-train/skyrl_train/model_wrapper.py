@@ -109,7 +109,7 @@ class HFModelWrapper(nn.Module):
                 trust_remote_code=True,
                 attn_implementation=self.attn_implementation,
                 quantization_config=nf4_config,
-                torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+                torch_dtype=torch.bfloat16,
                 device_map=device_map,
                 low_cpu_mem_usage=True,
                 use_safetensors=True,

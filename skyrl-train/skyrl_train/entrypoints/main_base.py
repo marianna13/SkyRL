@@ -44,12 +44,13 @@ def create_ray_wrapped_inference_engines_from_config(
 ):
     from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 
+    inference_model = cfg.generator.inference_model_path or cfg.trainer.policy.model.path
     engine_kwargs = {
         "num_inference_engines": cfg.generator.num_inference_engines,
         "tensor_parallel_size": cfg.generator.inference_engine_tensor_parallel_size,
         "pipeline_parallel_size": cfg.generator.inference_engine_pipeline_parallel_size,
         "model_dtype": cfg.generator.model_dtype,
-        "pretrain": cfg.trainer.policy.model.path,
+        "pretrain": inference_model,
         "seed": cfg.trainer.seed,
         "vllm_v1_disable_multiproc": cfg.generator.vllm_v1_disable_multiproc,
         "enable_prefix_caching": cfg.generator.enable_prefix_caching,
@@ -68,8 +69,17 @@ def create_ray_wrapped_inference_engines_from_config(
         "enable_ray_prometheus_stats": cfg.generator.enable_ray_prometheus_stats,
     }
 
+    # Disable custom all-reduce if configured (needed for mxfp4 models)
+    if getattr(cfg.generator, 'disable_custom_all_reduce', False):
+        engine_kwargs.setdefault("engine_init_kwargs", {})
+        if isinstance(engine_kwargs["engine_init_kwargs"], dict):
+            engine_kwargs["engine_init_kwargs"]["disable_custom_all_reduce"] = True
+        else:
+            engine_kwargs["engine_init_kwargs"] = {"disable_custom_all_reduce": True}
+
     # Conditionally add LoRA parameters if LoRA is enabled
-    if cfg.trainer.policy.model.lora.rank > 0 and cfg.trainer.strategy != "megatron":
+    # Also enable for Megatron when using inference_model_path (LoRA disk sync)
+    if cfg.trainer.policy.model.lora.rank > 0 and (cfg.trainer.strategy != "megatron" or cfg.generator.inference_model_path):
         engine_kwargs["enable_lora"] = True
         engine_kwargs["max_lora_rank"] = cfg.trainer.policy.model.lora.rank
         engine_kwargs["sleep_level"] = 1
@@ -101,9 +111,10 @@ def create_remote_inference_engines_from_config(
 ):
     # TODO(tgriggs): We may want a separate config for the model name in case
     # it's different from the name used in the OpenAI API
+    inference_model = cfg.generator.inference_model_path or cfg.trainer.policy.model.path
     return create_remote_inference_engines(
         urls=cfg.generator.remote_inference_engine_urls,
-        model_name=cfg.trainer.policy.model.path,
+        model_name=inference_model,
         engine_backend=cfg.generator.backend,
         tokenizer=tokenizer,
         tensor_parallel_size=cfg.generator.inference_engine_tensor_parallel_size,
@@ -215,12 +226,13 @@ class BasePPOExp:
         """
         from skyrl_train.generators.skyrl_gym_generator import SkyRLGymGenerator
 
+        inference_model = cfg.generator.inference_model_path or cfg.trainer.policy.model.path
         return SkyRLGymGenerator(
             generator_cfg=cfg.generator,
             skyrl_gym_cfg=cfg.environment.skyrl_gym,
             inference_engine_client=inference_engine_client,
             tokenizer=tokenizer,
-            model_name=cfg.trainer.policy.model.path,
+            model_name=inference_model,
         )
 
     def get_trainer(
@@ -359,10 +371,11 @@ class BasePPOExp:
                 f"proxy_url={proxy_url}, server_urls={server_urls}, colocated={is_colocated}"
             )
 
+        inference_model = self.cfg.generator.inference_model_path or self.cfg.trainer.policy.model.path
         return RemoteInferenceClient(
             proxy_url=proxy_url,
             server_urls=server_urls,
-            model_name=self.cfg.trainer.policy.model.path,
+            model_name=inference_model,
         )
 
     def _setup_trainer(self):

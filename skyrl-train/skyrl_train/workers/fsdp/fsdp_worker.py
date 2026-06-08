@@ -122,8 +122,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             wrapped_model = HFModelWrapper(
                 model_path,
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
-                # NOTE (sumanthrh): Model initialization should always be in fp32
-                # during training
+                # NOTE: JURECA uses bf16=True. fp32 init breaks the bf16→mxfp4
+                # weight sync path on Jupiter (produces garbage outputs).
                 bf16=True,
                 lora_rank=self.cfg.trainer.policy.model.lora.rank,
                 lora_alpha=self.cfg.trainer.policy.model.lora.alpha,

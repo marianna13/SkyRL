@@ -204,10 +204,30 @@ class TinkerEngine:
         """Initialize the engine with a database connection and base model."""
         self.config = config
         self.db_engine = create_engine(
-            config.database_url, 
+            config.database_url,
             echo=False,
             poolclass=NullPool
             )
+
+        # Configure SQLite for concurrent workloads:
+        # - WAL (write-ahead logging) lets readers proceed while a writer holds
+        #   the lock, reducing "database is locked" errors under RL batching.
+        # - busy_timeout tells SQLite to wait up to N ms before erroring when
+        #   a lock is held, rather than failing immediately.
+        # - synchronous=NORMAL is safe under WAL and faster than FULL.
+        if config.database_url.startswith("sqlite"):
+            from sqlalchemy import event as _sa_event
+
+            @_sa_event.listens_for(self.db_engine, "connect")
+            def _set_sqlite_pragmas(dbapi_connection, connection_record):
+                try:
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    cursor.execute("PRAGMA busy_timeout=60000;")  # 60s
+                    cursor.execute("PRAGMA synchronous=NORMAL;")
+                    cursor.close()
+                except Exception as _e:
+                    logger.warning(f"Failed to set SQLite pragmas: {_e}")
 
         # Initialize the backend (handles model state, computation, and adapter management)
         backend_class, backend_config_class = get_backend_classes(config.backend)
@@ -220,11 +240,12 @@ class TinkerEngine:
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
 
-        policy_num_nodes = self.backend.config.trainer.placement.policy_num_nodes if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
-        policy_num_gpus_per_node = self.backend.config.trainer.placement.policy_num_gpus_per_node if getattr(self.backend.config, "trainer") and self.backend.config.trainer.placement else 1
+        logger.info(f"Initial dp_size reported by backend: {self.dp_size}")
 
-        self.dp_size = policy_num_nodes * policy_num_gpus_per_node
-        logger.info(f"Data parallel size (dp_size) set to {self.dp_size} based on backend placement config: policy_num_nodes={policy_num_nodes}, policy_num_gpus_per_node={policy_num_gpus_per_node}")
+    @property
+    def dp_size(self) -> int:
+        """Get the data parallel size from the backend."""
+        return self.backend.dp_size
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -283,7 +304,19 @@ class TinkerEngine:
             .where(FutureDB.status == RequestStatus.PENDING)
             .group_by(FutureDB.model_id)
         )
-        barriers = dict(session.exec(barriers_query).all())
+        barriers = {}
+        _max_retries = 30
+        for i in range(_max_retries):
+            try:
+                barriers = dict(session.exec(barriers_query).all())
+                break
+            except Exception as e:
+                if i == _max_retries - 1:
+                    logger.error(f"barriers_query failed after {_max_retries} retries: {e}")
+                    raise
+                logger.warning(f"barriers_query transient error (retry {i + 1}/{_max_retries}): {e}")
+                time.sleep(2)
+
 
         # Get all pending operations of the requested type ordered by request_id
         query = (
@@ -469,7 +502,23 @@ class TinkerEngine:
         logger.info(f"{__file__}, requests: {requests.keys()} sequences")
         prepared = prepare_model_pass_batch(requests)
         logger.info(f"{__file__}, prepared batch: {len(prepared.all_input_ids)} sequences")
-        return self.backend.forward_backward(prepared)
+
+        # Forward the caller's loss_fn to the backend. Default to "cross_entropy"
+        # only when the batch is empty; otherwise we'd take the SFT path and skip
+        # the RL policy-gradient loss entirely (producing zero LoRA gradients).
+        loss_fn = "cross_entropy"
+        if requests:
+            first_req = next(iter(requests.values()))
+            _, request_data = first_req
+            loss_fn = getattr(request_data, "loss_fn", loss_fn)
+            # Sanity: all requests in this batch should agree on loss_fn
+            for _rid, (_mid, _rd) in requests.items():
+                _rlf = getattr(_rd, "loss_fn", None)
+                if _rlf is not None and _rlf != loss_fn:
+                    logger.warning(
+                        f"Mixed loss_fn in batch: req {_rid} has {_rlf!r} but using {loss_fn!r}"
+                    )
+        return self.backend.forward_backward(prepared, loss_fn=loss_fn)
 
     def process_forward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward-only pass on a batch of requests."""
@@ -636,7 +685,7 @@ class TinkerEngine:
     def process_pending_requests(self):
         """Main loop to process pending requests."""
         num_retries = 0
-        max_retries = 5
+        max_retries = 30  # Wait up to 30 seconds for batch completion
         while True:
             # Query for pending requests and extract data within session context
             with Session(self.db_engine) as session:
@@ -645,19 +694,21 @@ class TinkerEngine:
                     session, types.RequestType.FORWARD_BACKWARD
                 )
 
-
                 # check if it's divisible by dp_size, if not, we may have to wait for more requests to fill the batch.
-                if total_len > 0 and total_len % self.dp_size != 0:
-                    logger.warning(f"Number of batchable forward/backward requests ({total_len}) is not divisible by data parallel size ({self.dp_size}). This may lead to suboptimal performance. Waiting for more requests to arrive to fill the batch...{total_len}/{self.dp_size} currently.")
-                    logger.warning(f"Batchable forward/backward request IDs: {list(forward_backward_requests.keys())}")
-                    time.sleep(1)  # Sleep briefly to allow more requests to arrive and fill the batch
-                    num_retries += 1
-                    if num_retries > max_retries:
-                        raise RuntimeError(f"Max retries reached for waiting on batchable forward/backward requests. Current batch size: {total_len}.")
-                    continue  # Re-query for batchable requests in the next loop iteration
-    
+                dp_size = self.dp_size
+                if total_len > 0 and total_len % dp_size != 0:
+                    if num_retries < max_retries:
+                        logger.warning(f"Number of batchable forward/backward requests ({total_len}) is not divisible by data parallel size ({dp_size}). Waiting for more requests... ({num_retries}/{max_retries})")
+                        time.sleep(1)
+                        num_retries += 1
+                        continue
+                    else:
+                        logger.warning(f"Batch size ({total_len}) still not divisible by dp_size ({dp_size}) after {max_retries} retries. Proceeding anyway - backend will handle padding.")
+                
+                # Reset retries if we found a good batch or reached limit
+                num_retries = 0
 
-                forward_requests, total_len = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
+                forward_requests, _ = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
                 # Find pending sample requests that can be batched
                 sample_requests = self.find_batchable_sample(session)
                 # Get other pending requests (non forward_backward and non sampling)
@@ -668,10 +719,10 @@ class TinkerEngine:
             self.process_batch_requests(forward_requests, self.process_forward, "forward")
             self.process_batch_requests(sample_requests, self.process_sample, "sample")
 
-            # Process other request types individually (in the future we can also batch independent optim_steps)
+            # Process other request types individually
             self.process_single_requests(other_requests)
 
-            # Periodically cleanup stale sessions (disabled if either config is negative)
+            # Periodically cleanup stale sessions
             cleanup_enabled = self.config.session_cleanup_interval_sec >= 0 and self.config.session_timeout_sec >= 0
             if cleanup_enabled and time.time() - self._last_cleanup_time > self.config.session_cleanup_interval_sec:
                 _ = self.cleanup_stale_sessions()

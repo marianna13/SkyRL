@@ -346,6 +346,7 @@ class ChatTemplateConfig(BaseConfig):
 @dataclass
 class GeneratorConfig(BaseConfig):
     model_name: str = ""
+    inference_model_path: Optional[str] = None
     model_dtype: str = "bfloat16"
     run_engines_locally: bool = True
     num_inference_engines: int = 1
@@ -365,6 +366,7 @@ class GeneratorConfig(BaseConfig):
     enable_chunked_prefill: bool = True
     max_num_batched_tokens: int = 8192
     enforce_eager: bool = True
+    enable_lora: bool = False
     fully_sharded_loras: bool = False
     enable_ray_prometheus_stats: bool = False
     gpu_memory_utilization: float = 0.8
@@ -454,7 +456,7 @@ class TrainerConfig(BaseConfig):
     micro_train_batch_size_per_gpu: int = 1
     micro_forward_batch_size_per_gpu: int = 1
     update_ref_every_epoch: bool = False
-    use_sample_packing: bool = True
+    use_sample_packing: bool = False
     eval_batch_size: int = 1024
     eval_before_train: bool = True
     eval_interval: int = 5

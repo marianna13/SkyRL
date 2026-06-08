@@ -616,7 +616,7 @@ def collect_lora_params(module) -> OrderedDict:
                     if hasattr(param, "full_tensor"):  # e.g. FSDP FlatParameter
                         # This usually works; if it still CPU-offloads, you can wrap similarly.
                         t = param.full_tensor().detach()
-                    out[name] = t.cpu()
+                out[name] = t.cpu()
 
         torch.cuda.empty_cache()
         return out

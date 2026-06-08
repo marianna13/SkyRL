@@ -11,6 +11,30 @@ import torch.nn as nn
 from torch import optim
 from torch import distributed as dist
 
+# Allowlist common optimizer and scheduler classes for safe unpickling in PyTorch 2.6+
+if hasattr(torch.serialization, 'add_safe_globals'):
+    safe_globals = [
+        torch.optim.AdamW,
+        torch.optim.Adam,
+        torch.optim.SGD,
+        torch.optim.lr_scheduler.LRScheduler,
+        torch.optim.lr_scheduler.LambdaLR,
+        torch.optim.lr_scheduler.StepLR,
+        torch.optim.lr_scheduler.MultiStepLR,
+        torch.optim.lr_scheduler.ExponentialLR,
+        torch.optim.lr_scheduler.CosineAnnealingLR,
+        torch.optim.lr_scheduler.ReduceLROnPlateau,
+        torch.optim.lr_scheduler.OneCycleLR,
+        torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+    ]
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+        safe_globals.append(FusedAdam)
+    except ImportError:
+        pass
+    
+    torch.serialization.add_safe_globals(safe_globals)
+
 from skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl_train.distributed.utils import ModelOrModelOptimPair
 from skyrl_train.utils.io import io
@@ -120,15 +144,17 @@ class MegatronStrategy(DistributedStrategy):
         """
         try:
             _mem("start offload_to_cpu")
+            # Catch early errors from previous kernels
+            torch.cuda.synchronize()
 
             if offload_model:
                 _mem("before offload_megatron_model_to_cpu")
-                offload_megatron_model_to_cpu(model)
+                offload_megatron_model_to_cpu(model, pin_memory=pin_memory, non_blocking=non_blocking)
                 _mem("after offload_megatron_model_to_cpu")
 
             if optimizer and offload_optimizer:
                 _mem("before offload_megatron_grads_to_cpu")
-                offload_megatron_grads_to_cpu(model)
+                offload_megatron_grads_to_cpu(model, non_blocking=non_blocking)
                 _mem("after offload_megatron_grads_to_cpu")
 
                 _mem("before offload_megatron_optimizer")
@@ -136,9 +162,9 @@ class MegatronStrategy(DistributedStrategy):
                 _mem("after offload_megatron_optimizer")
 
             # If there was a CUDA async error earlier, this is where it will surface.
-            _mem("before synchronize")
+            _mem("before final synchronize")
             torch.cuda.synchronize()
-            _mem("after synchronize")
+            _mem("after final synchronize")
 
         except Exception as e:
             print("OFFLOAD FAILED:", repr(e), flush=True)
@@ -146,6 +172,16 @@ class MegatronStrategy(DistributedStrategy):
             # This helps catch “silent” CUDA errors:
             if torch.cuda.is_available():
                 print("CUDA error state:", torch.cuda.get_device_properties(0), flush=True)
+            
+            if "unspecified launch failure" in str(e).lower():
+                print("\nCRITICAL: CUDA 'unspecified launch failure' detected. "
+                      "This is often caused by 'NVTE_FUSED_ATTN=1' on GH200/Hopper systems. "
+                      "Try setting 'export NVTE_FUSED_ATTN=0' in your launch script.\n", flush=True)
+            
+            if "no dot product attention backend is available" in str(e).lower():
+                print("\nCRITICAL: TransformerEngine 'No dot product attention backend is available' detected. "
+                      "This usually happens when 'NVTE_FUSED_ATTN=1' is set but no compatible fused kernel was found. "
+                      "Try setting 'export NVTE_FUSED_ATTN=0' in your launch script to allow fallback to non-fused backends.\n", flush=True)
             raise
         finally:
             gc.collect()
@@ -156,9 +192,9 @@ class MegatronStrategy(DistributedStrategy):
     def backload_to_gpu(self, model, optimizer, non_blocking=True, backload_optimizer=True, backload_model=True):
         """Reload model weights back to GPU."""
         if backload_model:
-            load_megatron_model_to_gpu(model)
+            load_megatron_model_to_gpu(model, non_blocking=non_blocking)
         if optimizer and backload_optimizer:
-            load_megatron_grads_to_gpu(model)
+            load_megatron_grads_to_gpu(model, non_blocking=non_blocking)
             load_megatron_optimizer(optimizer)
         torch.cuda.synchronize()
 
@@ -213,7 +249,14 @@ class MegatronStrategy(DistributedStrategy):
         if not self.is_lora:
             sharded_state_dict["model"] = model_sharded_state_dict
         if optimizer:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
+            # Use 'fully_reshardable' format to correctly preserve EDP replica_id
+            # for MoE expert params. The deprecated 'fully_sharded_model_space' format
+            # discards EDP info via replica_id[:2], causing checkpoint validation
+            # failures with EP>1. (verl#4303 / Megatron-Bridge#1564)
+            optim_ckpt_metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                model_sharded_state_dict, metadata=optim_ckpt_metadata
+            )
         if scheduler:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
@@ -250,11 +293,12 @@ class MegatronStrategy(DistributedStrategy):
         ckpt_base.async_calls = AsyncCallsQueue(persistent=True)
         self.print(f"Checkpoint successfully saved to {ckpt_dir}")
 
-    def _get_rank_path(self, ckpt_dir):
+    def _get_rank_path(self, ckpt_dir, dp_rank=None):
         tp_rank = mpu.get_tensor_model_parallel_rank()
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         cp_rank = mpu.get_context_parallel_rank()
-        dp_rank = mpu.get_data_parallel_rank()
+        if dp_rank is None:
+            dp_rank = mpu.get_data_parallel_rank()
         ep_rank = mpu.get_expert_model_parallel_rank()
         etp_rank = mpu.get_expert_tensor_parallel_rank()
 
@@ -292,59 +336,99 @@ class MegatronStrategy(DistributedStrategy):
         if not ckpt_dir or not io.exists(ckpt_dir):
             raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
 
-        # Extract base model.
-        model: List[nn.Module] = model.actor_module
-        assert len(model) == 1, "Megatron virtual pipeline parallel is not yet supported"
-        unwrapped_model = model[0]
-        while hasattr(unwrapped_model, "module"):
-            unwrapped_model = unwrapped_model.module
+        try:
+            _mem(f"start load_checkpoint from {ckpt_dir}")
+            torch.cuda.synchronize()
+            dist.barrier()
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        # Extract sharded state dicts.
-        sharded_state_dict = {}
-        model_sharded_state_dict = unwrapped_model.sharded_state_dict()
-        if not self.is_lora:
-            sharded_state_dict["model"] = model_sharded_state_dict
-        if optimizer and load_optimizer_states:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(model_sharded_state_dict)
-        if scheduler and load_lr_scheduler_states:
-            sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
+            # Extract base model.
+            model_list: List[nn.Module] = model.actor_module
+            assert len(model_list) == 1, "Megatron virtual pipeline parallel is not yet supported"
+            unwrapped_model = model_list[0]
+            while hasattr(unwrapped_model, "module"):
+                unwrapped_model = unwrapped_model.module
 
-        with io.local_read_dir(ckpt_dir) as read_dir:
-            # Load the checkpoint in parallel.
-            load_strategy = get_default_load_sharded_strategy(read_dir)
-            load_strategy = FullyParallelLoadStrategyWrapper(
-                load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
-            )
-            state_dict = dist_checkpointing.load(
-                sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
-            )
-        if not self.is_lora:
-            # Load the model, optimizer, and scheduler state dicts.
-            assert (
-                "model" in state_dict
-            ), f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            model[0].load_state_dict(state_dict["model"], strict=load_module_strict)
-            self.print("Loaded model state dict.")
-        else:
-            self._load_lora_adapters(unwrapped_model, ckpt_dir)
+            # Extract sharded state dicts.
+            _mem("before extracting sharded state dict")
+            sharded_state_dict = {}
+            model_sharded_state_dict = unwrapped_model.sharded_state_dict()
+            if not self.is_lora:
+                sharded_state_dict["model"] = model_sharded_state_dict
+            
+            if optimizer and load_optimizer_states:
+                _mem("before optimizer.sharded_state_dict")
+                # Must match save format: 'fully_reshardable' preserves EDP replica_id
+                optim_ckpt_metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                    model_sharded_state_dict, is_loading=True, metadata=optim_ckpt_metadata
+                )
+            
+            if scheduler and load_lr_scheduler_states:
+                sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
-        if optimizer and load_optimizer_states:
-            assert (
-                "optimizer" in state_dict
-            ), f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            optimizer.load_state_dict(state_dict["optimizer"])
-            self.print("Loaded optimizer state dict.")
+            _mem(f"after extracting sharded state dict (keys: {list(sharded_state_dict.keys())}), before dist_checkpointing.load")
+            
+            with io.local_read_dir(ckpt_dir) as read_dir:
+                # Load the checkpoint in parallel.
+                load_strategy = get_default_load_sharded_strategy(read_dir)
+                load_strategy = FullyParallelLoadStrategyWrapper(
+                    load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+                )
+                state_dict = dist_checkpointing.load(
+                    sharded_state_dict=sharded_state_dict, checkpoint_dir=read_dir, sharded_strategy=load_strategy
+                )
+            
+            _mem("after dist_checkpointing.load")
+            torch.cuda.synchronize()
+            dist.barrier()
 
-        if scheduler and load_lr_scheduler_states:
-            assert (
-                "lr_scheduler" in state_dict
-            ), f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            scheduler.load_state_dict(state_dict["lr_scheduler"])
-            self.print("Loaded LR scheduler state dict.")
+            if not self.is_lora:
+                # Load the model, optimizer, and scheduler state dicts.
+                assert (
+                    "model" in state_dict
+                ), f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                model_list[0].load_state_dict(state_dict["model"], strict=load_module_strict)
+                self.print("Loaded model state dict.")
+            else:
+                _mem("before _load_lora_adapters")
+                self._load_lora_adapters(unwrapped_model, ckpt_dir)
+                _mem("after _load_lora_adapters")
 
-        # Load RNG state, if present.
-        if "rng" in state_dict:
-            self.load_rng_state(state_dict["rng"])
+            if optimizer and load_optimizer_states:
+                assert (
+                    "optimizer" in state_dict
+                ), f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                optimizer.load_state_dict(state_dict["optimizer"])
+                self.print("Loaded optimizer state dict.")
+
+            if scheduler and load_lr_scheduler_states:
+                assert (
+                    "lr_scheduler" in state_dict
+                ), f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                scheduler.load_state_dict(state_dict["lr_scheduler"])
+                self.print("Loaded LR scheduler state dict.")
+
+            # Load RNG state, if present.
+            if "rng" in state_dict:
+                self.load_rng_state(state_dict["rng"])
+
+            _mem("end load_checkpoint")
+            torch.cuda.synchronize()
+            dist.barrier()
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            self.print(f"ERROR in load_checkpoint: {repr(e)}")
+            traceback.print_exc()
+            
+            if "no dot product attention backend is available" in str(e).lower():
+                self.print("\nCRITICAL: TransformerEngine 'No dot product attention backend is available' detected during model loading. "
+                      "This usually happens when 'NVTE_FUSED_ATTN=1' is set but the model configuration or hardware is incompatible. "
+                      "Try setting 'export NVTE_FUSED_ATTN=0' in your launch script to allow fallback to non-fused backends.\n")
+            raise e
 
         return ckpt_dir, {}
 
@@ -358,7 +442,20 @@ class MegatronStrategy(DistributedStrategy):
 
         with io.local_read_dir(ckpt_dir) as read_dir:
             adapter_path = self._get_rank_path(read_dir)
-            state_dict = torch.load(adapter_path, map_location="cpu")
+
+            # Fallback to dp0 if current dp_rank file does not exist
+            if not os.path.exists(adapter_path):
+                dp_rank = mpu.get_data_parallel_rank()
+                if dp_rank > 0:
+                    adapter_path_dp0 = self._get_rank_path(read_dir, dp_rank=0)
+                    if os.path.exists(adapter_path_dp0):
+                        self.print(
+                            f"LoRA adapter for dp_rank {dp_rank} not found at {adapter_path}. "
+                            f"Falling back to dp_rank 0 at {adapter_path_dp0}"
+                        )
+                        adapter_path = adapter_path_dp0
+
+            state_dict = torch.load(adapter_path, map_location="cpu", weights_only=False)
             _, unexpected = model.load_state_dict(state_dict["model_state_dict"], strict=False)
             if len(unexpected) > 0:
                 raise ValueError(f"Unexpected keys in LoRA adapter state dict: {unexpected}")
@@ -372,7 +469,7 @@ class MegatronStrategy(DistributedStrategy):
 
         # All ranks call into bridge.
         with io.local_work_dir(output_dir) as work_dir:
-            bridge.save_hf_weights(model.actor_module, work_dir)
+            bridge.save_hf_weights(model.actor_module, work_dir, strict=False)
             self.print(f"Successfully saved HF safetensors model to {output_dir}")
 
             # Only rank 0 saves the Huggingface config and tokenizer.

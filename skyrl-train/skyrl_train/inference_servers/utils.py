@@ -18,8 +18,9 @@ def build_vllm_cli_args(cfg: "Union[SkyRLConfig, DictConfig]") -> Namespace:
     # parse args without any command line arguments
     args: Namespace = parser.parse_args(args=[])
 
+    inference_model = cfg.generator.inference_model_path or cfg.trainer.policy.model.path
     overrides = dict(
-        model=cfg.trainer.policy.model.path,
+        model=inference_model,
         tensor_parallel_size=cfg.generator.inference_engine_tensor_parallel_size,
         pipeline_parallel_size=cfg.generator.inference_engine_pipeline_parallel_size,
         dtype=cfg.generator.model_dtype,

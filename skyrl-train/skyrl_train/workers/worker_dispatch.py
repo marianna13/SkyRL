@@ -236,12 +236,21 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "forward_backward")
 
         # With DP>1, each rank returns loss_fn_outputs for its data chunk.
-        # Concatenate them in rank order to get the full batch's outputs.
+        # Collect only from DP-primary ranks (dedup TP/SP/PP replicas) and order
+        # by DP rank so the concatenated list aligns with the original batch order.
         # Scalar metrics (loss, lr) are already all-reduced, so use statuses[0] for those.
         if len(statuses) > 1 and statuses[0] and "loss_fn_outputs" in statuses[0]:
+            actor_infos = self._actor_groups[model].actor_infos
+            dp_size = actor_infos[0].rank.dp_size
+            dp_rank_to_outputs: dict[int, list] = {}
+            for actor_info, status in zip(actor_infos, statuses):
+                if actor_info.rank.is_collection_dp_rank():
+                    dp_rank_to_outputs[actor_info.rank.dp] = status.pop("loss_fn_outputs", [])
+                else:
+                    status.pop("loss_fn_outputs", None)
             all_loss_fn_outputs = []
-            for status in statuses:
-                all_loss_fn_outputs.extend(status.pop("loss_fn_outputs", []))
+            for dp in range(dp_size):
+                all_loss_fn_outputs.extend(dp_rank_to_outputs.get(dp, []))
             result = statuses[0]
             result["loss_fn_outputs"] = all_loss_fn_outputs
             return result

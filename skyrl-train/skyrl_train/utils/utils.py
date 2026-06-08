@@ -672,6 +672,11 @@ def prepare_runtime_environment(cfg: Union[SkyRLConfig, DictConfig]) -> dict[str
         logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
         env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
 
+    # Propagate NVTE environment variables if they are set in the environment
+    for key in os.environ:
+        if key.startswith("NVTE_"):
+            env_vars[key] = os.environ[key]
+
     return env_vars
 
 
@@ -799,14 +804,50 @@ def torch_dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def str_to_torch_dtype(dtype: str) -> torch.dtype:
-    if dtype == "bfloat16":
-        return torch.bfloat16
-    elif dtype == "float16":
-        return torch.float16
-    elif dtype == "float32":
-        return torch.float32
-    else:
-        return torch.dtype(dtype)
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    
+    if not isinstance(dtype, str):
+        raise ValueError(f"Expected string or torch.dtype, got {type(dtype)}")
+
+    # Clean up the string: remove 'torch.' prefix if present, and convert to lowercase
+    s = dtype.strip()
+    if s.startswith("torch."):
+        s = s[6:]
+    s = s.lower()
+    
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float64": torch.float64,
+        "fp64": torch.float64,
+        "double": torch.float64,
+        "int32": torch.int32,
+        "int64": torch.int64,
+        "long": torch.int64,
+        "int": torch.int64,
+        "bool": torch.bool,
+        "uint8": torch.uint8,
+    }
+    
+    if s in dtype_map:
+        return dtype_map[s]
+    
+    # Try to get from torch module directly (case-insensitive search if needed, but torch dtypes are lowercase)
+    # Check both as is and with lowercase
+    for name in [s, dtype.strip()]:
+        if hasattr(torch, name):
+            val = getattr(torch, name)
+            if isinstance(val, torch.dtype):
+                return val
+        
+    raise ValueError(f"Unknown dtype string: {dtype}")
 
 
 def format_gib(mem_bytes: int) -> str:
