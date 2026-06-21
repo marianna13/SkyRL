@@ -152,6 +152,7 @@ class GeneratorConfig(BaseModel, extra="allow"):
     inference_engine_tensor_parallel_size: int = 1
     model_dtype: str = "bfloat16"
     run_engines_locally: bool = True
+    enforce_eager: bool = True
     engine_init_kwargs: dict = {}
 
 class AlgorithmConfig(BaseModel, extra="allow"):
@@ -282,6 +283,10 @@ def _build_config(
     cfg.generator.http_endpoint_port = config.generator.http_endpoint_port
     cfg.generator.model_dtype = config.generator.model_dtype
     cfg.generator.run_engines_locally = config.generator.run_engines_locally
+    # enforce_eager=False enables CUDA graphs (big decode win for 120b at low batch).
+    # The main_base entrypoint auto-flips this to False under LoRA; the tx backend does not,
+    # so we plumb it explicitly from the backend CONFIG (default stays True to match SkyRL).
+    cfg.generator.enforce_eager = config.generator.enforce_eager
     # cfg.generator.enable_lora = config.generator.enable_lora
     cfg.generator.engine_init_kwargs = config.generator.engine_init_kwargs
     if config.generator.inference_model_path:
@@ -775,11 +780,22 @@ class SkyRLTrainBackend(AbstractBackend):
         ckpt_dir = os.path.join(self.config.trainer.ckpt_path, "checkpoint")
         os.makedirs(ckpt_dir, exist_ok=True)
 
+        import time as _time
+        _t0 = _time.perf_counter()
         # Save checkpoint directory (includes optimizer state automatically)
         self._trainer.dispatch.save_checkpoint(model="policy", ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
+        _t_save = _time.perf_counter() - _t0
 
         # Create tar archive
+        _t0 = _time.perf_counter()
         self._create_tar_from_directory(ckpt_dir, output_path)
+        _t_tar = _time.perf_counter() - _t0
+        try:
+            _sz = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(ckpt_dir) for f in fs)
+            logger.info(f"[ckpt-timing] dispatch.save_checkpoint={_t_save:.1f}s tar={_t_tar:.1f}s "
+                        f"ckpt_dir_size={_sz/1e9:.2f}GB")
+        except Exception:
+            logger.info(f"[ckpt-timing] dispatch.save_checkpoint={_t_save:.1f}s tar={_t_tar:.1f}s")
 
         logger.info(f"Saved checkpoint for {model_id} to {output_path}")
 

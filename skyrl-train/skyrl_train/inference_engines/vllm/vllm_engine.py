@@ -333,6 +333,28 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         engine = vllm.AsyncLLMEngine.from_engine_args(engine_args, stat_loggers=stat_loggers)
 
+        # Surface the RESOLVED engine config through the skyrl logger (always reaches the logs),
+        # so we can confirm what vLLM actually built: quantization (MXFP4 vs bf16) and whether
+        # speculative decoding was accepted. Defensive — never let introspection break startup.
+        try:
+            mc = engine.model_config
+            spec_cfg = None
+            for obj in (getattr(engine, "vllm_config", None), engine_args):
+                spec_cfg = getattr(obj, "speculative_config", None)
+                if spec_cfg is not None:
+                    break
+            _quant = getattr(mc, "quantization", None)
+            _dtype = getattr(mc, "dtype", None)
+            _maxlen = getattr(mc, "max_model_len", None)
+            _tp = kwargs.get("tensor_parallel_size")
+            _model = kwargs.get("model")
+            logger.info(
+                f"[engine-config] model={_model} quantization={_quant} dtype={_dtype} "
+                f"max_model_len={_maxlen} tp={_tp} speculative_config={spec_cfg}"
+            )
+        except Exception as e:
+            logger.warning(f"[engine-config] could not introspect resolved engine config: {e}")
+
         # Adapted from https://github.com/volcengine/verl/blob/e90f18c40aa639cd25092b78a5ff7e2d2508c088/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L327
         model_config = engine.model_config
         model_path = kwargs.get("model")

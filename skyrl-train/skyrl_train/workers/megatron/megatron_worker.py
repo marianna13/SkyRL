@@ -123,11 +123,14 @@ class MegatronWeightExtractor(WeightExtractor):
             self.param_buckets[-1].append(task)
             curr_size += size
 
-    def extract_weights(self, dtype: torch.dtype):
+    def extract_weights(self, dtype: torch.dtype, lora_adapter_sink=None):
         """Extract weights from Megatron model.
 
         Args:
             dtype: Target dtype for inference
+            lora_adapter_sink: optional dict; if provided, the bridge populates it with the
+                gathered LoRA adapter tensors (PEFT format) as a side-effect of the export.
+                Non-destructive — the merged weights are still yielded for broadcast.
 
         Yields:
             WeightChunk objects (one per parameter, or one per bucket if bucketing enabled)
@@ -140,6 +143,7 @@ class MegatronWeightExtractor(WeightExtractor):
                 self.actor_module,
                 show_progress=False,
                 conversion_tasks=None,
+                lora_adapter_sink=lora_adapter_sink,
             )
 
             for name, tensor in hf_params_generator:
@@ -159,6 +163,7 @@ class MegatronWeightExtractor(WeightExtractor):
                     self.actor_module,
                     show_progress=False,
                     conversion_tasks=bucket,
+                    lora_adapter_sink=lora_adapter_sink,
                 )
 
                 # Collect all parameters in this bucket into one chunk
@@ -581,6 +586,44 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             bf16=self.cfg.trainer.bf16,
         )
 
+        # ONE-TIME: if SAVE_MEGATRON_CKPT is set, save the base Megatron dist-checkpoint of the
+        # just-built model (HF weights already converted, LoRA keys stripped) so future runs can
+        # set MEGATRON_CKPT_PATH=<path> and SKIP the ~20-30 min hf->megatron conversion at startup.
+        # Run a normal job once with SAVE_MEGATRON_CKPT set and MEGATRON_CKPT_PATH UNSET; cancel
+        # after the "[megatron_ckpt_save] DONE" line. Only the policy worker saves (no ref race).
+        _save_ckpt = os.environ.get("SAVE_MEGATRON_CKPT")
+        if _save_ckpt and getattr(self, "_megatron_ckpt_path", None) is None:
+            from megatron.core.dist_checkpointing.serialization import save as _dist_ckpt_save
+
+            def _unwrap_m(m):
+                while hasattr(m, "module"):
+                    m = m.module
+                return m
+
+            def _strip_lora(sd):
+                if not isinstance(sd, dict):
+                    return sd
+                return {k: _strip_lora(v) for k, v in sd.items() if ".adapter." not in str(k)}
+
+            _iter_dir = os.path.join(_save_ckpt, "iter_0000000")
+            os.makedirs(_iter_dir, exist_ok=True)
+            _unwrapped = [_unwrap_m(m) for m in self.actor_module]
+            if len(_unwrapped) == 1:
+                _sharded = _strip_lora(_unwrapped[0].sharded_state_dict())
+            else:
+                _sharded = {f"model{i}": _strip_lora(m.sharded_state_dict()) for i, m in enumerate(_unwrapped)}
+            logger.info(f"[megatron_ckpt_save] saving base Megatron dist-checkpoint to {_iter_dir} ...")
+            _dist_ckpt_save(_sharded, _iter_dir)
+            torch.distributed.barrier()
+            if torch.distributed.get_rank() == 0:
+                with open(os.path.join(_save_ckpt, "latest_checkpointed_iteration.txt"), "w") as _f:
+                    _f.write("0")
+            torch.distributed.barrier()
+            logger.info(
+                f"[megatron_ckpt_save] DONE -> {_save_ckpt}. Set MEGATRON_CKPT_PATH={_save_ckpt} "
+                f"on future runs to skip the hf->megatron conversion. You can CANCEL this job now."
+            )
+
         if self._local_rank == 0 and not os.path.exists(
             model_path
         ):  # if not local path, try downloading model weights from huggingface
@@ -962,62 +1005,64 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 param_group["lr"] = learning_rate
 
     async def _save_lora_adapters_and_sync(self, lora_sync_path, inference_engine_client):
-        """Extract LoRA adapter weights from Megatron model and sync to inference engines via disk."""
+        """Capture the per-expert LoRA adapter via the bridge sink, then push it to the inference
+        engines with add_lora — replacing the ~233GB full-model NCCL broadcast with a ~5GB adapter
+        push. The bridge emits vLLM fused-MoE PEFT format (per-expert, gate/up split). The export's
+        EP/TP gather is COLLECTIVE, so ALL ranks consume the generator (no rank-0-only hang); the
+        merged-base tensors it yields are discarded. Per-rank sinks are gathered + unioned on rank 0,
+        which saves the adapter and triggers add_lora."""
         import os
         import json
+        import time as _time
         from safetensors.torch import save_file
         from skyrl_train.weight_sync import LoraLoadRequest
 
-        if torch.distributed.get_rank() == 0:
-            os.makedirs(lora_sync_path, exist_ok=True)
+        _t0 = _time.perf_counter()
+        generator_dtype = str_to_torch_dtype(self.cfg.generator.model_dtype)
+        _sink = {}
+        for _ in self.weight_extractor.extract_weights(generator_dtype, lora_adapter_sink=_sink):
+            pass  # discard merged base; _sink gets the per-expert adapter as a side-effect
+        _t_conv = _time.perf_counter()
 
-            # Use Bridge's export_hf_weights for proper Megatron→HF name mapping,
-            # but only keep adapter/lora parameters
-            lora_params = {}
-            hf_params_generator = self.bridge.export_hf_weights(
-                self.actor_module,
-                show_progress=False,
-                conversion_tasks=None,
-            )
-            for name, tensor in hf_params_generator:
-                if ".adapter." in name or ".lora_" in name:
-                    logger.info(f"[LoRA sync] export_hf_weights adapter param: {name} shape={tensor.shape}")
-                    # Convert adapter names to PEFT format
-                    hf_name = name
-                    if ".adapter.linear_in.weight" in name:
-                        hf_name = name.replace(".adapter.linear_in.weight", ".lora_A.weight")
-                    elif ".adapter.linear_out.weight" in name:
-                        hf_name = name.replace(".adapter.linear_out.weight", ".lora_B.weight")
-                    elif ".adapter.lora_a.weight" in name:
-                        hf_name = name.replace(".adapter.lora_a.weight", ".lora_A.weight")
-                    elif ".adapter.lora_b.weight" in name:
-                        hf_name = name.replace(".adapter.lora_b.weight", ".lora_B.weight")
-                    hf_name = "base_model.model." + hf_name
-                    logger.info(f"[LoRA sync] → mapped to: {hf_name}")
-                    lora_params[hf_name] = tensor.cpu().to(torch.bfloat16)
-
-            if lora_params:
-                save_file(lora_params, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-
-                # Write minimal adapter config
-                lora_config = self.cfg.trainer.policy.model.lora
-                peft_config = {
-                    "peft_type": "LORA",
-                    "task_type": "CAUSAL_LM",
-                    "r": lora_config.rank,
-                    "lora_alpha": lora_config.alpha if hasattr(lora_config, 'alpha') else lora_config.rank,
-                    "lora_dropout": getattr(lora_config, 'dropout', 0.0),
-                    "target_modules": list(lora_config.target_modules) if hasattr(lora_config, 'target_modules') and lora_config.target_modules else ["gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"],
-                    "bias": "none",
+        _is0 = torch.distributed.get_rank() == 0
+        _gathered = [None] * torch.distributed.get_world_size() if _is0 else None
+        torch.distributed.gather_object(_sink, _gathered, dst=0)
+        if _is0:
+            # Wrap rank-0-only work so an exception here can never skip the collective barrier
+            # below (which would otherwise hang every other rank).
+            try:
+                _merged = {}
+                for _d in (_gathered or []):
+                    if _d:
+                        _merged.update(_d)
+                os.makedirs(lora_sync_path, exist_ok=True)
+                save_file(_merged, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+                _lcfg = self.cfg.trainer.policy.model.lora
+                _mods = sorted({k.split(".lora_")[0].split(".")[-1] for k in _merged}) or [
+                    "gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"]
+                _peft = {
+                    "peft_type": "LORA", "task_type": "CAUSAL_LM", "r": _lcfg.rank,
+                    "lora_alpha": _lcfg.alpha if hasattr(_lcfg, "alpha") else _lcfg.rank,
+                    "lora_dropout": getattr(_lcfg, "dropout", 0.0),
+                    "target_modules": _mods, "bias": "none",
                 }
                 with open(os.path.join(lora_sync_path, "adapter_config.json"), "w") as f:
-                    json.dump(peft_config, f, indent=4)
-
-                lora_request = LoraLoadRequest(lora_path=lora_sync_path)
-                await inference_engine_client.update_named_weights(lora_request)
-            else:
-                logger.info("[LoRA sync] No LoRA params found, skipping sync (initial broadcast)")
-
+                    json.dump(_peft, f, indent=2)
+                _nb = sum(t.numel() * t.element_size() for t in _merged.values())
+                _t_save = _time.perf_counter()
+                if _merged:
+                    await inference_engine_client.update_named_weights(LoraLoadRequest(lora_path=lora_sync_path))
+                else:
+                    logger.warning("[LoRA-sync] sink EMPTY — no adapter captured, engines NOT updated")
+                logger.info(
+                    f"[LoRA-sync] {len(_merged)} per-expert tensors ({_nb / 1e9:.2f}GB) | "
+                    f"conv={_t_conv - _t0:.1f}s save={_t_save - _t_conv:.1f}s "
+                    f"add_lora={_time.perf_counter() - _t_save:.1f}s TOTAL={_time.perf_counter() - _t0:.1f}s"
+                )
+            except Exception as _e:
+                import traceback
+                logger.error(f"[LoRA-sync] rank0 save/add_lora FAILED (engines keep prior weights): "
+                             f"{_e}\n{traceback.format_exc()}")
         torch.distributed.barrier()
 
     async def broadcast_to_inference_engines(self, inference_engine_client):
@@ -1040,8 +1085,87 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 inference_engine_client,
             )
         else:
-            # Extract and send weights using the sender created at init time
-            await self._weight_transfer_sender.send_chunks(self.weight_extractor.extract_weights(generator_dtype))
+            # Extract and send weights using the sender created at init time.
+            # NOTE: this is the ACTIVE sync path (because generator.inference_model_path is unset,
+            # so _use_lora_sync=False). extract_weights() runs a FULL 120B megatron→HF conversion
+            # and broadcasts EVERY param to all engines — even though only the LoRA adapter changed
+            # and the base is frozen. Instrument total time + broadcast volume to confirm the waste.
+            import time as _time
+            import os as _os
+            _t_bcast0 = _time.perf_counter()
+            _bstats = {"n": 0, "bytes": 0}
+
+            def _counting(_gen):
+                for _ch in _gen:
+                    _bstats["n"] += 1
+                    for _t in _ch.tensors:
+                        _bstats["bytes"] += _t.numel() * _t.element_size()
+                    yield _ch
+
+            # NON-DESTRUCTIVE adapter capture for validation (LORA_ADAPTER_SYNC=1). The bridge
+            # populates this sink with the gathered LoRA adapter (PEFT format) as a side-effect
+            # of the export we already do for the broadcast; the merged weights are still
+            # broadcast as usual, so the run is unchanged. We then save the adapter to disk so
+            # the receiver path (vLLM add_lora on the MXFP4 base) can be validated offline.
+            _adapter_sink = {} if _os.environ.get("LORA_ADAPTER_SYNC") == "1" else None
+            # Reset the bridge's per-sync gate counter so we can see why the capture is empty.
+            _mb = None
+            if _adapter_sink is not None:
+                try:
+                    from megatron.bridge.models.conversion import model_bridge as _mb
+                    _mb._LORA_CAPTURE_STATS.clear()
+                except Exception:
+                    _mb = None
+            await self._weight_transfer_sender.send_chunks(
+                _counting(self.weight_extractor.extract_weights(generator_dtype, lora_adapter_sink=_adapter_sink))
+            )
+            # Each rank only captured the params whose merge completed locally (EP/TP locality),
+            # so any single rank's sink is incomplete. Gather all ranks' sinks to rank 0 and union.
+            _gathered = None
+            _gstats = None
+            if _adapter_sink is not None:
+                _is0 = torch.distributed.get_rank() == 0
+                _gathered = [None] * torch.distributed.get_world_size() if _is0 else None
+                torch.distributed.gather_object(_adapter_sink, _gathered, dst=0)
+                _local_stats = dict(getattr(_mb, "_LORA_CAPTURE_STATS", {})) if _mb is not None else {}
+                _gstats = [None] * torch.distributed.get_world_size() if _is0 else None
+                torch.distributed.gather_object(_local_stats, _gstats, dst=0)
+            if torch.distributed.get_rank() == 0:
+                logger.info(
+                    f"[weight-sync-timing] full-model broadcast (else branch): "
+                    f"{_time.perf_counter() - _t_bcast0:.1f}s | params={_bstats['n']} "
+                    f"broadcast={_bstats['bytes'] / 1e9:.1f}GB"
+                )
+                if _adapter_sink is not None:
+                    try:
+                        from safetensors.torch import save_file as _save_file
+                        _merged = {}
+                        _per_rank = []
+                        for _d in (_gathered or []):
+                            _per_rank.append(len(_d) if _d else 0)
+                            if _d:
+                                _merged.update(_d)
+                        _adir = _os.path.join(
+                            self.cfg.trainer.policy.model.lora.lora_sync_path, "adapter_capture"
+                        )
+                        _os.makedirs(_adir, exist_ok=True)
+                        _nbytes = sum(t.numel() * t.element_size() for t in _merged.values())
+                        if _merged:
+                            _save_file(_merged, _os.path.join(_adir, "adapter_model.safetensors"))
+                        _keys = sorted(_merged.keys())
+                        _stat_sum = {}
+                        for _s in (_gstats or []):
+                            for _k, _v in (_s or {}).items():
+                                _stat_sum[_k] = _stat_sum.get(_k, 0) + _v
+                        logger.info(
+                            f"[lora-capture] saved {len(_merged)} adapter tensors "
+                            f"({_nbytes / 1e6:.1f}MB) to {_adir} | per_rank_counts={_per_rank} "
+                            f"gate_stats={_stat_sum} "
+                            f"sample_keys={_keys[:4]} "
+                            f"sample_shapes={[tuple(_merged[k].shape) for k in _keys[:4]]}"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"[lora-capture] failed to save captured adapter: {_e}")
 
         if cache_reset_task is not None:
             await cache_reset_task

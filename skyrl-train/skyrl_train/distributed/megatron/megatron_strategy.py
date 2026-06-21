@@ -244,10 +244,15 @@ class MegatronStrategy(DistributedStrategy):
         dist.barrier()
 
         # Collect the sharded state dicts for model and optimizer, and full state dict for the scheduler.
+        import time as _time
+        _ckpt_t = {}
+        _t0 = _time.perf_counter()
         sharded_state_dict = {}
         model_sharded_state_dict = unwrapped_model.sharded_state_dict()
+        _ckpt_t["model_sharded_state_dict"] = _time.perf_counter() - _t0
         if not self.is_lora:
             sharded_state_dict["model"] = model_sharded_state_dict
+        _t0 = _time.perf_counter()
         if optimizer:
             # Use 'fully_reshardable' format to correctly preserve EDP replica_id
             # for MoE expert params. The deprecated 'fully_sharded_model_space' format
@@ -257,11 +262,13 @@ class MegatronStrategy(DistributedStrategy):
             sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
                 model_sharded_state_dict, metadata=optim_ckpt_metadata
             )
+        _ckpt_t["optimizer_sharded_state_dict"] = _time.perf_counter() - _t0
         if scheduler:
             sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
         # Save RNG state.
         sharded_state_dict["rng"] = self.get_rng_state()
+        _t0 = _time.perf_counter()
 
         # Save the checkpoint across ranks in parallel.
         save_strategy = get_default_save_sharded_strategy("torch_dist")
@@ -285,12 +292,19 @@ class MegatronStrategy(DistributedStrategy):
                 hf_dir = os.path.join(work_dir, "huggingface")
                 self.save_hf_configs(self.hf_config, hf_dir, tokenizer)
 
+        _ckpt_t["dist_checkpointing_save"] = _time.perf_counter() - _t0
+        _t0 = _time.perf_counter()
         if self.is_lora:
             self._save_lora_adapters(unwrapped_model, ckpt_dir)
+        _ckpt_t["save_lora_adapters"] = _time.perf_counter() - _t0
 
         dist.barrier()
         ckpt_base.async_calls.close()
         ckpt_base.async_calls = AsyncCallsQueue(persistent=True)
+        self.print(
+            "[ckpt-timing] " + " ".join(f"{k}={v:.1f}s" for k, v in _ckpt_t.items())
+            + f" | is_lora={self.is_lora}"
+        )
         self.print(f"Checkpoint successfully saved to {ckpt_dir}")
 
     def _get_rank_path(self, ckpt_dir, dp_rank=None):

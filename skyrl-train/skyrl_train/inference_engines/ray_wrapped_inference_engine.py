@@ -120,6 +120,20 @@ def create_ray_wrapped_inference_engines(
         ray_noset_visible_devices,
     )
 
+    # engine_init_kwargs may arrive as an OmegaConf DictConfig in struct mode. vLLM mutates
+    # nested engine config in place (e.g. SpeculativeConfig injects `target_model_config` into
+    # speculative_config), which raises ConfigKeyError("... is not in struct") under OmegaConf
+    # struct mode. Deep-convert to plain Python dicts/lists so vLLM can freely add keys.
+    try:
+        from omegaconf import OmegaConf, DictConfig, ListConfig
+
+        if isinstance(engine_init_kwargs, (DictConfig, ListConfig)):
+            engine_init_kwargs = OmegaConf.to_container(engine_init_kwargs, resolve=True)
+        if isinstance(rope_scaling, (DictConfig, ListConfig)):
+            rope_scaling = OmegaConf.to_container(rope_scaling, resolve=True)
+    except ImportError:
+        pass
+
     if backend == "vllm":
         import vllm
 
