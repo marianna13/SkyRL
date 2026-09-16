@@ -311,6 +311,7 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput], step
     rollout_metrics = get_rollout_metrics(
         result["response_ids"],
         result["rewards"],
+        env_metrics=result.get("env_metrics"),
         loss_masks=result.get("loss_masks"),
         trajectory_completion_times=trajectory_generation_times,
         trajectory_time_splits=trajectory_time_splits,
@@ -326,7 +327,7 @@ def concatenate_generator_outputs(generator_outputs: List[GeneratorOutput], step
             if k not in rollout_metrics and isinstance(v, (int, float)):
                 extra_keys.setdefault(k, []).append(v)
     for k, values in extra_keys.items():
-        if "avg" in k or "mean" in k:
+        if "avg" in k or "mean" in k or k.endswith("_rate"):
             rollout_metrics[k] = sum(values) / len(values)
         elif "min" in k:
             rollout_metrics[k] = min(values)
@@ -406,6 +407,38 @@ def _add_time_stats(rollout_metrics: Dict[str, Any], name: str, times: Optional[
             f"generate/trajectory_time_{name}_max": np.max(arr).item(),
         }
     )
+
+
+def _add_numeric_env_metric_stats(
+    rollout_metrics: Dict[str, Any],
+    env_metrics: Optional[List[Dict[str, Any]]],
+) -> None:
+    """Aggregate task-independent numeric metrics emitted by environments.
+
+    Environments may expose any numeric verifier metric. The reserved
+    construction_performance key additionally receives stable cross-task names
+    so dashboards can compare the main objective even when its task-native
+    name is sum_radii, score, latency, or something else.
+    """
+    if not env_metrics:
+        return
+    values_by_key: Dict[str, List[float]] = defaultdict(list)
+    for metrics in env_metrics:
+        for key, value in (metrics or {}).items():
+            if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+                numeric_value = float(value)
+                if np.isfinite(numeric_value):
+                    values_by_key[str(key)].append(numeric_value)
+
+    for key, values in values_by_key.items():
+        arr = np.asarray(values, dtype=np.float64)
+        rollout_metrics[f"environment/{key}_avg"] = np.mean(arr).item()
+        rollout_metrics[f"environment/{key}_min"] = np.min(arr).item()
+        rollout_metrics[f"environment/{key}_max"] = np.max(arr).item()
+        if key == "construction_performance":
+            rollout_metrics["construction/performance_avg"] = np.mean(arr).item()
+            rollout_metrics["construction/performance_min"] = np.min(arr).item()
+            rollout_metrics["construction/performance_max"] = np.max(arr).item()
 
 
 def get_rollout_metrics(
@@ -494,6 +527,8 @@ def get_rollout_metrics(
         for times in trajectory_time_splits.values():
             other = other - np.array(times, dtype=np.float64)
         _add_time_stats(rollout_metrics, "other", other.tolist())
+
+    _add_numeric_env_metric_stats(rollout_metrics, env_metrics)
 
     if env_metrics is not None and env_classes is not None:
         env_to_metrics = defaultdict(list)
@@ -843,6 +878,9 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
     acc_loss_mask: List[int] = list(gen_out["loss_masks"][0])
     acc_logprobs: Optional[List[float]] = list(gen_out["rollout_logprobs"][0]) if has_logprobs else None
     acc_rewards_tokens: Optional[List[float]] = list(gen_out["rewards"][0]) if is_token_level_rewards else None
+    # Offset of the current turn's completion within ``acc_response``.  Tokens
+    # before this offset are retained conversation context from earlier turns.
+    current_response_start = 0
     last = 0
 
     def flush():
@@ -860,23 +898,51 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
 
     for i in range(1, n):
         full_merged = acc_prompt + acc_response
+        next_prompt = gen_out["prompt_token_ids"][i]
 
-        # If prompt[i-1] + response[i-1] is not a prefix of prompt[i], flush the current merge group
-        # and start a new group to merge.
-        if not _is_prefix(full_merged, gen_out["prompt_token_ids"][i]):
+        if not _is_prefix(full_merged, next_prompt):
+            # Reasoning parsers (for example Qwen's ``<think>...</think>``
+            # parser) may return token IDs for the full generated completion
+            # while retaining only its visible answer in conversation history.
+            # In that case the next prompt contains the context preceding the
+            # current completion followed by an exact suffix of that
+            # completion.  Drop the omitted prefix so that the merged training
+            # sequence has exactly the context used during rollout.
+            context_before_current = acc_prompt + acc_response[:current_response_start]
+            current_response = acc_response[current_response_start:]
+            retained_suffix_start = _find_retained_response_suffix(
+                current_response,
+                next_prompt[len(context_before_current) :]
+                if _is_prefix(context_before_current, next_prompt)
+                else [],
+            )
+            if retained_suffix_start is not None:
+                dropped_end = current_response_start + retained_suffix_start
+                del acc_response[current_response_start:dropped_end]
+                del acc_loss_mask[current_response_start:dropped_end]
+                if acc_logprobs is not None:
+                    del acc_logprobs[current_response_start:dropped_end]
+                if acc_rewards_tokens is not None:
+                    del acc_rewards_tokens[current_response_start:dropped_end]
+                full_merged = acc_prompt + acc_response
+
+        # If neither the complete response nor a context-retained response
+        # suffix is a prefix of the next prompt, keep the turns separate.
+        if not _is_prefix(full_merged, next_prompt):
             flush()
-            acc_prompt = list(gen_out["prompt_token_ids"][i])
+            acc_prompt = list(next_prompt)
             acc_response = list(gen_out["response_ids"][i])
             acc_loss_mask = list(gen_out["loss_masks"][i])
             acc_logprobs = list(gen_out["rollout_logprobs"][i]) if has_logprobs else None
             acc_rewards_tokens = list(gen_out["rewards"][i]) if is_token_level_rewards else None
+            current_response_start = 0
             last = i
             continue
 
         # prompt[i-1] + response[i-1] is a prefix of prompt[i], so we can merge the two turns.
         # obs_delta is the newly prefilled tokens not generated by the assistant, so we need to
         # properly loss mask them.
-        obs_delta = gen_out["prompt_token_ids"][i][len(full_merged) :]
+        obs_delta = next_prompt[len(full_merged) :]
 
         # Merge obs_delta to the fields, assigning zeros since it is not generated by the assistant.
         acc_response.extend(obs_delta)
@@ -887,6 +953,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
             acc_rewards_tokens.extend([0.0] * len(obs_delta))
 
         # Extend the current merge group with the next turn's fields, exactly the same preserved.
+        current_response_start = len(acc_response)
         acc_response.extend(gen_out["response_ids"][i])
         acc_loss_mask.extend(gen_out["loss_masks"][i])
         if acc_logprobs is not None:
@@ -909,6 +976,39 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
         "rollout_expert_indices": None,
         "is_last_step": out_is_last_step,
     }
+
+
+# Long enough to avoid treating a coincidental short token overlap as a
+# reasoning-stripped response.  The shortest visible Qwen response observed in
+# Harbor rollouts is comfortably longer than this.
+_MIN_RETAINED_RESPONSE_SUFFIX_TOKENS = 8
+
+
+def _find_retained_response_suffix(response: List[int], prompt_delta: List[int]) -> Optional[int]:
+    """Find a substantial response suffix retained at the start of a later prompt.
+
+    Some inference APIs expose token IDs for hidden reasoning even though their
+    reasoning parser removes that prefix from the assistant message stored in
+    conversation history.  Return the start of the longest response suffix that
+    is an exact prefix of ``prompt_delta``.  Short matches are rejected to avoid
+    merging unrelated turns accidentally.
+    """
+    min_tokens = _MIN_RETAINED_RESPONSE_SUFFIX_TOKENS
+    if len(response) <= min_tokens or len(prompt_delta) < min_tokens:
+        return None
+
+    # Start at 1: start=0 is the ordinary full-response prefix case handled by
+    # the caller. A suffix longer than prompt_delta cannot match. Filtering on
+    # the first token also avoids repeatedly comparing long code completions.
+    # Iterating upward selects the longest qualifying suffix.
+    first_start = max(1, len(response) - len(prompt_delta))
+    for start in range(first_start, len(response) - min_tokens + 1):
+        if response[start] != prompt_delta[0]:
+            continue
+        suffix = response[start:]
+        if suffix == prompt_delta[: len(suffix)]:
+            return start
+    return None
 
 
 def merge_stepwise_output(generator_output: GeneratorOutput) -> GeneratorOutput:

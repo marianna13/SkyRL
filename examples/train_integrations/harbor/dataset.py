@@ -102,3 +102,51 @@ class HarborTaskDataset:
     def collate_fn(self, item_list):
         """Collate function for batching task dictionaries."""
         return item_list
+
+
+class TTTHarborOneTaskDataset(HarborTaskDataset):
+    """Expose one physical Harbor task as a virtual dataset.
+
+    SkyRL expects a training batch to contain train_batch_size distinct prompt
+    UIDs. Reusing UID "0" would make downstream group-aware minibatching treat
+    all virtual prompts as one prompt, so each virtual row gets its own stable
+    UID while still pointing at the same task directory.
+    """
+
+    def __init__(self, data_files: List[str], virtual_size: int):
+        super().__init__(data_files=data_files)
+        if len(self.task_paths) != 1:
+            raise ValueError(
+                "TTTHarborOneTaskDataset requires exactly one valid Harbor task, "
+                f"but found {len(self.task_paths)}"
+            )
+        if virtual_size < 1:
+            raise ValueError(f"virtual_size must be positive, got {virtual_size}")
+        self.virtual_size = int(virtual_size)
+        logger.info(
+            "Repeating Harbor task {} over {} virtual dataset rows",
+            self.task_paths[0],
+            self.virtual_size,
+        )
+
+    def __len__(self) -> int:
+        return self.virtual_size
+
+    def __getitem__(self, index: int) -> dict:
+        if index < 0:
+            index += self.virtual_size
+        if index < 0 or index >= self.virtual_size:
+            raise IndexError(
+                f"Index {index} out of range for virtual dataset of size {self.virtual_size}"
+            )
+        task_path = str(self.task_paths[0])
+        return {
+            "prompt": task_path,
+            "env_class": None,
+            "env_extras": {"data_source": task_path},
+            "uid": f"ttt-{index}",
+        }
+
+    def __iter__(self):
+        for index in range(self.virtual_size):
+            yield self[index]

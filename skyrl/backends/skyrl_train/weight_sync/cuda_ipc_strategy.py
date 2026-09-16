@@ -34,7 +34,6 @@ from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightTransferSender,
     WeightTransferStrategy,
 )
-from skyrl.train.utils.utils import str_to_torch_dtype
 
 # IPC handle type: (rebuild_func, args) returned by reduce_tensor
 IpcHandle = Tuple[Callable[..., torch.Tensor], Tuple[Any, ...]]
@@ -187,8 +186,6 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         world_size = torch.distributed.get_world_size()
         device = torch.cuda.current_device()
         gpu_uuid = str(torch.cuda.get_device_properties(device).uuid)
-        dtype = str_to_torch_dtype(self._init_info.model_dtype_str)
-        dtype_name = self._init_info.model_dtype_str.split(".")[-1]
 
         if rank == 0:
             await self._inference_client.start_weight_update(is_checkpoint_format=True)
@@ -198,6 +195,13 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
             # --- pack all tensors in this chunk into one contiguous buffer ---
             # Chunk tensors share a single dtype by construction (see
             # weight_extractor_utils.py), so offsets in element units are safe.
+            chunk_dtypes = {tensor.dtype for tensor in chunk.tensors}
+            if len(chunk_dtypes) != 1:
+                raise ValueError(
+                    "CUDA IPC weight chunks must contain exactly one dtype; " f"got {sorted(map(str, chunk_dtypes))}"
+                )
+            dtype = next(iter(chunk_dtypes))
+            dtype_name = str(dtype).split(".")[-1]
             names: List[str] = []
             dtype_names: List[str] = []
             shapes: List[List[int]] = []

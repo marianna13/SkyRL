@@ -26,6 +26,9 @@ dependencies = [
     "xxhash>=3.0.0",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+skyrl_grug = "skyrl.backends.skyrl_train.inference_servers.grug_vllm_plugin:register"
+
 [project.optional-dependencies]
 gpu = [
     "jax[cuda13]>=0.7.2; sys_platform == 'linux'",

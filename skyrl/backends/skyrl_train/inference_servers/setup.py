@@ -288,6 +288,8 @@ def build_new_inference_client(
             placement_group=placement_group,
         )
 
+    logger.info(f"ie_cfg: {ie_cfg}")
+
     client = RemoteInferenceClient(
         proxy_url=server_setup.proxy_url,
         server_urls=server_setup.server_urls,

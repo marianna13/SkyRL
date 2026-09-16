@@ -3,6 +3,7 @@ import logging
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
@@ -24,6 +25,12 @@ from skyrl.train.generators.base import (
 )
 from skyrl.train.generators.utils import get_rollout_metrics
 from skyrl.train.utils.rate_limiter import create_rate_limiter
+
+from .reward_shaping import (
+    read_bounded_verifier_output,
+    score_harbor_trajectory_async,
+    shape_reward_from_output,
+)
 
 litellm.suppress_debug_info = True  # Suppress the "Provider List" output
 litellm.set_verbose = False
@@ -48,6 +55,27 @@ class HarborTrajectoryOutput:
     # (agent_timeout / error) that we will mask in `build_step_wise_generator_output`.
     rollout_details: Optional[List[RolloutDetail]] = None
     reward: float = 0.0
+    # Keep verifier reward separate so pass@k/eval metrics remain comparable
+    # when the training reward includes a small process bonus.
+    raw_reward: Optional[float] = None
+    test_output_reward: Optional[float] = None
+    test_output_parsed: bool = False
+    test_output_passed: int = 0
+    test_output_total: int = 0
+    process_bonus: float = 0.0
+    process_penalty: float = 0.0
+    process_premature_completion: bool = False
+    process_multi_tool_turns: int = 0
+    process_wrote_tests: bool = False
+    process_ran_tests: bool = False
+    process_used_syntax_checker: bool = False
+    process_reasoning_chars_per_turn: float = 0.0
+    process_concise_reasoning_bonus: float = 0.0
+    process_oracle_test_reward: float = 0.0
+    process_n_valid_tests: int = 0
+    process_n_discriminating_tests: int = 0
+    process_n_fixed_tests: int = 0
+    process_test_use_reward: float = 0.0
     num_turns: int = 0
     # One of: "complete", "context_length", "agent_timeout", "error". Used by
     # `build_step_wise_generator_output` to decide whether to skip the entire prompt group.
@@ -170,7 +198,7 @@ def build_step_wise_generator_output(
         # 2.5. For trajectory-level metrics, record the last turn's prompt IDs and response IDs which
         # contains the entire trajectory.
         response_ids_for_metrics.append(prompt_token_ids_per_turn[-1] + completion_token_ids_per_turn[-1])
-        rewards_for_metrics.append(traj.reward)
+        rewards_for_metrics.append(traj.raw_reward if traj.raw_reward is not None else traj.reward)
         trajectory_generation_times_per_prompt.append(traj.e2e_time)
 
     # 3. Aggregate trajectory-level metrics for logging.
@@ -193,6 +221,62 @@ def build_step_wise_generator_output(
         rollout_metrics["generate/avg_num_turns"] = sum(t.num_turns for t in successful_trajectories) / len(
             successful_trajectories
         )
+        rollout_metrics["reward/avg_process_bonus"] = sum(t.process_bonus for t in successful_trajectories) / len(
+            successful_trajectories
+        )
+        rollout_metrics["reward/avg_process_penalty"] = sum(
+            t.process_penalty for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/premature_completion_rate"] = sum(
+            t.process_premature_completion for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_multi_tool_turns"] = sum(
+            t.process_multi_tool_turns for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/wrote_tests_rate"] = sum(
+            t.process_wrote_tests for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/ran_tests_rate"] = sum(
+            t.process_ran_tests for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/used_syntax_checker_rate"] = sum(
+            t.process_used_syntax_checker for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_reasoning_chars_per_turn"] = sum(
+            t.process_reasoning_chars_per_turn for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_concise_reasoning_bonus"] = sum(
+            t.process_concise_reasoning_bonus for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_oracle_test_reward"] = sum(
+            t.process_oracle_test_reward for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_n_valid_tests"] = sum(
+            t.process_n_valid_tests for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_n_discriminating_tests"] = sum(
+            t.process_n_discriminating_tests for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_n_fixed_tests"] = sum(
+            t.process_n_fixed_tests for t in successful_trajectories
+        ) / len(successful_trajectories)
+        rollout_metrics["reward/avg_test_use_reward"] = sum(
+            t.process_test_use_reward for t in successful_trajectories
+        ) / len(successful_trajectories)
+        shaped_trajectories = [
+            t for t in successful_trajectories if t.test_output_reward is not None
+        ]
+        if shaped_trajectories:
+            rollout_metrics["reward/avg_test_output_reward"] = sum(
+                t.test_output_reward for t in shaped_trajectories
+            ) / len(shaped_trajectories)
+            rollout_metrics["reward/test_output_parse_rate"] = sum(
+                t.test_output_parsed for t in shaped_trajectories
+            ) / len(shaped_trajectories)
+            rollout_metrics["reward/test_output_partial_credit_rate"] = sum(
+                t.test_output_parsed and 0.0 < t.test_output_reward < 1.0
+                for t in shaped_trajectories
+            ) / len(shaped_trajectories)
     else:
         rollout_metrics = {}
 
@@ -238,6 +322,7 @@ class HarborGenerator(GeneratorInterface):
         # which lets session-aware routing policies rebalance new trajectories.
         self.inference_engine_client = inference_engine_client
         self.generator_cfg = generator_cfg
+        self.reward_shaping_cfg = getattr(generator_cfg, "reward_shaping", None)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
 
@@ -306,6 +391,17 @@ class HarborGenerator(GeneratorInterface):
     async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
         prompts = input_batch["prompts"]
         trajectory_ids = input_batch["trajectory_ids"]
+        sampling_params = dict(input_batch.get("sampling_params") or {})
+        batch_metadata = input_batch.get("batch_metadata")
+
+        logger.info(
+            "Harbor sampling for {}: temperature={}, top_p={}, top_k={}, max_tokens={}",
+            getattr(batch_metadata, "training_phase", "unknown"),
+            sampling_params.get("temperature"),
+            sampling_params.get("top_p"),
+            sampling_params.get("top_k"),
+            sampling_params.get("max_tokens"),
+        )
 
         if trajectory_ids is None:
             raise ValueError("`trajectory_ids` is required in the input batch")
@@ -327,7 +423,12 @@ class HarborGenerator(GeneratorInterface):
         )
 
         async def _worker(idx, prompt, trajectory_id):
-            result = await self._harbor_agent_loop(prompt=prompt, trajectory_id=trajectory_id, cache_salt=cache_salt)
+            result = await self._harbor_agent_loop(
+                prompt=prompt,
+                trajectory_id=trajectory_id,
+                cache_salt=cache_salt,
+                sampling_params=sampling_params,
+            )
             all_outputs[idx] = result
             progress.update(1)
 
@@ -347,6 +448,7 @@ class HarborGenerator(GeneratorInterface):
         prompt: ConversationType,
         trajectory_id: TrajectoryID,
         cache_salt: Optional[str] = None,
+        sampling_params: Optional[dict] = None,
     ) -> HarborTrajectoryOutput:
         """Run a single Harbor trial and return the rollout details plus a trajectory-level reward.
         Retries on unknown errors; context length errors train with reward=0; agent timeouts mask the trajectory.
@@ -370,7 +472,31 @@ class HarborGenerator(GeneratorInterface):
                 # Create a fresh Trial each attempt so agent state is clean on retry.
                 config = deepcopy(self._harbor_trial_config_template)
                 config["task"] = {"path": prompt}
-                config["agent"]["kwargs"]["session_id"] = session_id
+                agent_kwargs = config["agent"]["kwargs"]
+                agent_kwargs["session_id"] = session_id
+
+                # SkyRL supplies distinct train/eval sampling parameters in each
+                # GeneratorInput. Apply them to the per-trial Harbor config rather
+                # than using the fixed template values for both phases.
+                if sampling_params:
+                    if sampling_params.get("temperature") is not None:
+                        agent_kwargs["temperature"] = sampling_params["temperature"]
+
+                    llm_kwargs = agent_kwargs.setdefault("llm_kwargs", {})
+                    for key in ("top_p", "top_k", "min_p", "stop"):
+                        if sampling_params.get(key) is not None:
+                            llm_kwargs[key] = sampling_params[key]
+
+                    llm_call_kwargs = agent_kwargs.setdefault("llm_call_kwargs", {})
+                    if sampling_params.get("max_tokens") is not None:
+                        llm_call_kwargs["max_tokens"] = sampling_params["max_tokens"]
+
+                    # These vLLM-only controls are OpenAI-compatible extensions.
+                    # LiteLLM forwards them in extra_body.
+                    extra_body = llm_call_kwargs.setdefault("extra_body", {})
+                    for key in ("min_tokens", "skip_special_tokens", "include_stop_str_in_output"):
+                        if sampling_params.get(key) is not None:
+                            extra_body[key] = sampling_params[key]
                 # Forward the salt via llm_kwargs.extra_body -> LiteLLM -> the vLLM request's top-level
                 # `cache_salt` field. vLLM rejects an empty salt, so attach only when set.
                 if cache_salt is not None:
@@ -405,6 +531,69 @@ class HarborGenerator(GeneratorInterface):
                     continue
                 else:
                     reward = float(results.verifier_result.rewards["reward"])
+
+                raw_reward = reward
+                test_output_reward = None
+                test_output_result = None
+                if (
+                    self.reward_shaping_cfg is not None
+                    and getattr(self.reward_shaping_cfg, "enable_reward_shaping", False)
+                    and not is_context_length_error
+                ):
+                    verifier_stdout = read_bounded_verifier_output(
+                        Path(trial.paths.test_stdout_path),
+                        getattr(
+                            self.reward_shaping_cfg,
+                            "reward_shaping_max_output_bytes",
+                            262_144,
+                        ),
+                    )
+                    test_output_result = shape_reward_from_output(
+                        stdout=verifier_stdout,
+                        original_reward=raw_reward,
+                        parser_name=getattr(self.reward_shaping_cfg, "reward_parser", None),
+                        shaper_name=getattr(
+                            self.reward_shaping_cfg, "reward_shaper", "pass_ratio"
+                        ),
+                        fallback_to_original=getattr(
+                            self.reward_shaping_cfg,
+                            "reward_shaping_fallback",
+                            True,
+                        ),
+                    )
+                    reward = test_output_result.reward
+                    test_output_reward = reward
+                    logger.debug(
+                        f"{prefix} test-output reward: raw={raw_reward:.4f}, "
+                        f"shaped={reward:.4f}, parsed={test_output_result.parsed}, "
+                        f"passed={test_output_result.passed}/{test_output_result.total}, "
+                        f"parser={test_output_result.parser}"
+                    )
+
+                if self.reward_shaping_cfg is not None:
+                    process_reward = await score_harbor_trajectory_async(
+                        Path(trial.paths.agent_dir) / "trajectory.json",
+                        verifier_reward=reward,
+                        config=self.reward_shaping_cfg,
+                    )
+                    reward = process_reward.training_reward
+                    process_bonus = process_reward.bonus
+                    process_penalty = process_reward.penalty
+                    if process_bonus > 0 or process_penalty > 0:
+                        logger.debug(
+                            f"{prefix} process reward: raw={raw_reward:.4f}, bonus={process_bonus:.4f}, "
+                            f"penalty={process_penalty:.4f}, "
+                            f"multi_tool_turns={process_reward.multi_tool_turns}, "
+                            f"wrote_tests={process_reward.wrote_tests}, ran_tests={process_reward.ran_tests}, "
+                            f"syntax_checker={process_reward.used_syntax_checker}, "
+                            f"premature_completion={process_reward.premature_completion}, "
+                            f"reasoning_chars_per_turn={process_reward.reasoning_chars_per_turn:.1f}, "
+                            f"concision_bonus={process_reward.concise_reasoning_bonus:.4f}"
+                        )
+                else:
+                    process_bonus = 0.0
+                    process_penalty = 0.0
+                    process_reward = None
 
                 # Extract rollout details and check for success
                 rollout_details = results.agent_result.rollout_details
@@ -443,6 +632,49 @@ class HarborGenerator(GeneratorInterface):
                 trajectory_id=trajectory_id,
                 rollout_details=rollout_details,
                 reward=reward,
+                raw_reward=raw_reward,
+                test_output_reward=test_output_reward,
+                test_output_parsed=(
+                    test_output_result.parsed if test_output_result is not None else False
+                ),
+                test_output_passed=(
+                    test_output_result.passed if test_output_result is not None else 0
+                ),
+                test_output_total=(
+                    test_output_result.total if test_output_result is not None else 0
+                ),
+                process_bonus=process_bonus,
+                process_penalty=process_penalty,
+                process_premature_completion=(
+                    process_reward.premature_completion if process_reward is not None else False
+                ),
+                process_multi_tool_turns=process_reward.multi_tool_turns if process_reward is not None else 0,
+                process_wrote_tests=process_reward.wrote_tests if process_reward is not None else False,
+                process_ran_tests=process_reward.ran_tests if process_reward is not None else False,
+                process_used_syntax_checker=(
+                    process_reward.used_syntax_checker if process_reward is not None else False
+                ),
+                process_reasoning_chars_per_turn=(
+                    process_reward.reasoning_chars_per_turn if process_reward is not None else 0.0
+                ),
+                process_concise_reasoning_bonus=(
+                    process_reward.concise_reasoning_bonus if process_reward is not None else 0.0
+                ),
+                process_oracle_test_reward=(
+                    process_reward.oracle_test_reward if process_reward is not None else 0.0
+                ),
+                process_n_valid_tests=(
+                    process_reward.n_valid_tests if process_reward is not None else 0
+                ),
+                process_n_discriminating_tests=(
+                    process_reward.n_discriminating_tests if process_reward is not None else 0
+                ),
+                process_n_fixed_tests=(
+                    process_reward.n_fixed_tests if process_reward is not None else 0
+                ),
+                process_test_use_reward=(
+                    process_reward.test_use_reward if process_reward is not None else 0.0
+                ),
                 num_turns=num_turns,
                 stop_reason="context_length" if is_context_length_error else "complete",
                 e2e_time=time.monotonic() - agent_loop_start_time,

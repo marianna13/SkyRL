@@ -75,6 +75,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     reduce_metrics,
 )
 from skyrl.env_vars import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+from skyrl.models.grug import is_grug_router_bias
 from skyrl.train.config.config import MegatronDDPConfig, get_config_as_dict
 from skyrl.train.utils.utils import str_to_torch_dtype, update_model_config
 from skyrl.utils.tok import get_tokenizer
@@ -117,6 +118,9 @@ class MegatronWeightExtractor(WeightExtractor):
         self.enable_bucketing = enable_bucketing
         self.bucket_size_threshold_GB = bucket_size_threshold_GB
         self.training_dtype = training_dtype
+        hf_pretrained = bridge.hf_pretrained
+        hf_config = getattr(hf_pretrained, "config", hf_pretrained)
+        self.model_type = getattr(hf_config, "model_type", None)
 
         # Defer bucket init to first extract_weights call.
         # At __init__ time the model may be CPU-offloaded (colocate_all),
@@ -125,6 +129,16 @@ class MegatronWeightExtractor(WeightExtractor):
         # called prepare_for_weight_sync → _ensure_on_gpu.
         self.bucket_index_groups = None
         self._buckets_initialized = False
+
+    def _weight_sync_dtype(
+        self, name: str, requested_dtype: torch.dtype
+    ) -> torch.dtype:
+        # Grug's frozen query bias is a genuine fp32 checkpoint value used for
+        # top-(k+1) expert selection. Casting it to bf16 during every sync can
+        # change routes even though trainer and rollout share the same weights.
+        if is_grug_router_bias(self.model_type, name):
+            return torch.float32
+        return requested_dtype
 
     def _init_param_buckets(self):
         """Compute bucket boundaries (index groups) from parameter sizes.
@@ -221,7 +235,6 @@ class MegatronWeightExtractor(WeightExtractor):
         names = []
         dtype_names = []
         shapes = []
-        dtype_name = str(dtype).split(".")[-1]
         # Collect parameter metadata in the same order
         # as provided by `.extract_weights`.
         if not self.enable_bucketing:
@@ -231,7 +244,8 @@ class MegatronWeightExtractor(WeightExtractor):
                 conversion_tasks=None,
             ):
                 names.append(name)
-                dtype_names.append(dtype_name)
+                sync_dtype = self._weight_sync_dtype(name, dtype)
+                dtype_names.append(str(sync_dtype).split(".")[-1])
                 shapes.append(list(tensor.shape))
                 del tensor
         else:
@@ -247,7 +261,8 @@ class MegatronWeightExtractor(WeightExtractor):
                 ):
                     names.append(name)
                     shapes.append(list(tensor.shape))
-                    dtype_names.append(dtype_name)
+                    sync_dtype = self._weight_sync_dtype(name, dtype)
+                    dtype_names.append(str(sync_dtype).split(".")[-1])
                     del tensor
 
         self._weight_metadata_cache = {"names": names, "dtype_names": dtype_names, "shapes": shapes}
@@ -282,11 +297,12 @@ class MegatronWeightExtractor(WeightExtractor):
             )
 
             for name, tensor in hf_params_generator:
-                tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+                sync_dtype = self._weight_sync_dtype(name, dtype)
+                tensor = tensor.to(device=device, dtype=sync_dtype, non_blocking=True)
 
                 yield WeightChunk(
                     names=[name],
-                    dtypes=[str(dtype)],
+                    dtypes=[str(sync_dtype)],
                     shapes=[list(tensor.shape)],
                     tensors=[tensor],
                 )
@@ -311,12 +327,34 @@ class MegatronWeightExtractor(WeightExtractor):
 
                 for name, tensor in hf_params_generator:
                     # Move to device and convert dtype
-                    tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+                    sync_dtype = self._weight_sync_dtype(name, dtype)
+                    tensor = tensor.to(device=device, dtype=sync_dtype, non_blocking=True)
+
+                    # Transfer chunks must be homogeneous for CUDA IPC. Flush
+                    # the regular bucket before a special-dtype state entry and
+                    # send that entry in its own chunk.
+                    if sync_dtype != dtype and tensors:
+                        yield WeightChunk(
+                            names=names,
+                            dtypes=dtypes_list,
+                            shapes=shapes,
+                            tensors=tensors,
+                        )
+                        names, dtypes_list, shapes, tensors = [], [], [], []
 
                     names.append(name)
-                    dtypes_list.append(str(dtype))
+                    dtypes_list.append(str(sync_dtype))
                     shapes.append(list(tensor.shape))
                     tensors.append(tensor)
+
+                    if sync_dtype != dtype:
+                        yield WeightChunk(
+                            names=names,
+                            dtypes=dtypes_list,
+                            shapes=shapes,
+                            tensors=tensors,
+                        )
+                        names, dtypes_list, shapes, tensors = [], [], [], []
 
                 # Yield one chunk containing all parameters in this bucket
                 if tensors:
@@ -1449,6 +1487,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
             )
+
+            logger.info(f"{__file__}: lora_name: {lora_name}, lora sync path: {lora_sync_path}")
 
             if isinstance(inference_engine_client, RemoteInferenceClient):
                 await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)

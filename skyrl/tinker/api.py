@@ -771,6 +771,7 @@ class SampleRequest(BaseModel):
 class SaveWeightsRequest(BaseModel):
     model_id: str
     path: str = Field(..., pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    seq_id: int | None = None
     type: Literal["save_weights"] | None = None
 
 
@@ -1195,6 +1196,20 @@ async def load_weights(request: LoadWeightsRequest, req: Request, session: Async
 @app.post("/api/v1/save_weights", response_model=FutureResponse)
 async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depends(get_session)):
     """Saves weights and training state."""
+    if request.seq_id is not None:
+        # Serialize concurrent retries before inserting the checkpoint. The SDK
+        # reuses seq_id when an accepted request's HTTP response times out.
+        await session.exec(select(ModelDB).where(ModelDB.model_id == request.model_id).with_for_update())
+        existing = (await session.exec(select(FutureDB).where(
+            FutureDB.model_id == request.model_id,
+            FutureDB.seq_id == request.seq_id,
+        ))).first()
+        if existing is not None:
+            if existing.request_type != types.RequestType.SAVE_WEIGHTS or existing.request_data != types.SaveWeightsInput(path=request.path).model_dump(mode="json"):
+                raise HTTPException(status_code=409, detail="Training request sequence number was reused")
+            request_id = existing.request_id
+            await session.commit()
+            return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
     # Create pending checkpoint entry (validates model exists)
     await create_checkpoint(
         session=session,
@@ -1208,6 +1223,7 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
         request_type=types.RequestType.SAVE_WEIGHTS,
         model_id=request.model_id,
         request_data=types.SaveWeightsInput(path=request.path),
+        seq_id=request.seq_id,
     )
 
     await session.commit()
@@ -1218,10 +1234,31 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
 @app.post("/api/v1/save_weights_for_sampler", response_model=FutureResponse)
 async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, session: AsyncSession = Depends(get_session)):
     """Saves weights in a format compatible with sampling/inference servers."""
+    checkpoint_id = request.path or f"ss{request.sampling_session_seq_id}_seq{request.seq_id}"
+    if request.seq_id is not None:
+        # Check before creating either the checkpoint or the sampling session.
+        # A retry must reuse the original session ID stored in the future.
+        await session.exec(select(ModelDB).where(ModelDB.model_id == request.model_id).with_for_update())
+        existing = (await session.exec(select(FutureDB).where(
+            FutureDB.model_id == request.model_id,
+            FutureDB.seq_id == request.seq_id,
+        ))).first()
+        if existing is not None:
+            expected = {
+                "path": checkpoint_id,
+                "sampling_session_seq_id": request.sampling_session_seq_id,
+                "seq_id": request.seq_id,
+            }
+            if existing.request_type != types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER or any(
+                existing.request_data.get(key) != value for key, value in expected.items()
+            ):
+                raise HTTPException(status_code=409, detail="Training request sequence number was reused")
+            request_id = existing.request_id
+            await session.commit()
+            return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
     # Get the model (validates it exists and gives us the session_id)
     model = await get_model(session, request.model_id)
 
-    checkpoint_id = request.path or f"ss{request.sampling_session_seq_id}_seq{request.seq_id}"
     sampling_session_id = None
     if request.sampling_session_seq_id is not None and request.seq_id is not None:
         # Create the sampling session using the model's session
@@ -1253,6 +1290,7 @@ async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, sessio
             seq_id=request.seq_id,
             sampling_session_id=sampling_session_id,
         ),
+        seq_id=request.seq_id,
     )
 
     await session.commit()
@@ -1281,6 +1319,8 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         )
 
     base_model, model_path = await get_sampling_model(request, session)
+
+    logger.info(f"base_model: {base_model}, model_path: {model_path}")
 
     if base_model:
         model_id = checkpoint_id = ""

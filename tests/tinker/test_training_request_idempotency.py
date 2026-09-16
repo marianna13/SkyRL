@@ -9,8 +9,47 @@ from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.tinker import types
-from skyrl.tinker.api import create_future
-from skyrl.tinker.db_models import FutureDB, enable_sqlite_wal
+from skyrl.tinker.api import (
+    SaveWeightsRequest, SaveWeightsForSamplerRequest, create_future,
+    save_weights, save_weights_for_sampler,
+)
+from skyrl.tinker.db_models import (
+    CheckpointDB, FutureDB, ModelDB, SamplingSessionDB, SessionDB, enable_sqlite_wal,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampler", [False, True])
+async def test_checkpoint_retry_reuses_future_and_rejects_conflicts(tmp_path, sampler):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'checkpoint.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine) as session:
+        session.add(SessionDB(session_id="session_1", sdk_version="test"))
+        await session.commit()
+        session.add(ModelDB(model_id="model_1", base_model="test", lora_config={},
+                            status="ready", request_id=1, session_id="session_1"))
+        await session.commit()
+
+    endpoint = save_weights_for_sampler if sampler else save_weights
+    request_cls = SaveWeightsForSamplerRequest if sampler else SaveWeightsRequest
+    extra = {"sampling_session_seq_id": 3} if sampler else {}
+    request = request_cls(model_id="model_1", path="000027", seq_id=7, **extra)
+    async with AsyncSession(engine) as session:
+        original = await endpoint(request, session)
+    # Use a fresh, expiring session, just as a new HTTP request would.
+    async with AsyncSession(engine) as session:
+        retry = await endpoint(request, session)
+        assert retry.future_id == original.future_id
+        assert len((await session.exec(select(FutureDB))).all()) == 1
+        assert len((await session.exec(select(CheckpointDB))).all()) == 1
+        assert len((await session.exec(select(SamplingSessionDB))).all()) == int(sampler)
+    for path, seq_id in [("different", 7), ("000027", 8)]:
+        async with AsyncSession(engine) as session:
+            with pytest.raises(HTTPException) as error:
+                await endpoint(request_cls(model_id="model_1", path=path, seq_id=seq_id, **extra), session)
+            assert error.value.status_code == 409
+    await engine.dispose()
 
 
 def optim_input(learning_rate: float = 1e-4) -> types.OptimStepInput:

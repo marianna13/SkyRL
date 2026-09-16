@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+skyrl_grug = skyrl.backends.skyrl_train.inference_servers.grug_vllm_plugin:register

@@ -95,6 +95,31 @@ def test_generator_output_concatenation():
         np.testing.assert_allclose(concatenated_output["rollout_metrics"][key], value)
 
 
+def test_generator_output_concatenation_averages_rate_metrics():
+    def make_output(rate: float, count: int) -> GeneratorOutput:
+        return {
+            "prompt_token_ids": [[1]],
+            "response_ids": [[1]],
+            "rewards": [0.0],
+            "loss_masks": [[1]],
+            "stop_reasons": ["stop"],
+            "rollout_logprobs": [[0.0]],
+            "rollout_metrics": {
+                "reward/wrote_tests_rate": rate,
+                "custom/count": count,
+            },
+        }
+
+    concatenated = concatenate_generator_outputs(
+        [make_output(0.25, 1), make_output(0.75, 2)]
+    )
+
+    assert concatenated["rollout_metrics"]["reward/wrote_tests_rate"] == pytest.approx(
+        0.5
+    )
+    assert concatenated["rollout_metrics"]["custom/count"] == 3
+
+
 def test_time_split_rollout_metrics():
     metrics = get_rollout_metrics(
         responses=[[1, 2]] * 4,
@@ -574,6 +599,54 @@ class TestMergeStepwiseOutput:
         assert merged["prompt_token_ids"] == [[10], [99, 88]]
         assert merged["response_ids"] == [[20], [40]]
         assert merged["is_last_step"] == [False, True]
+
+    def test_merge_when_hidden_reasoning_is_omitted_from_next_prompt(self):
+        """A reasoning parser may retain only the visible response in history."""
+        tid = _make_tid("reasoning_stripped")
+        hidden = [100, 101, 102]
+        visible = [20, 21, 22, 23, 24, 25, 26, 27]
+        gen_out: GeneratorOutput = {
+            "prompt_token_ids": [[10], [10] + visible + [30, 31]],
+            "response_ids": [hidden + visible, [40]],
+            "rewards": [[0.0] * 11, [1.0]],
+            "loss_masks": [[1] * 11, [1]],
+            "stop_reasons": ["continue", "eos"],
+            "rollout_metrics": None,
+            "rollout_logprobs": [[float(-i) for i in range(11)], [-12.0]],
+            "trajectory_ids": [tid, tid],
+            "rollout_expert_indices": None,
+            "is_last_step": [False, True],
+        }
+
+        merged = merge_stepwise_output(gen_out)
+
+        assert merged["prompt_token_ids"] == [[10]]
+        assert merged["response_ids"] == [visible + [30, 31, 40]]
+        assert merged["loss_masks"] == [[1] * 8 + [0, 0, 1]]
+        assert merged["rollout_logprobs"] == [[-3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, 0.0, 0.0, -12.0]]
+        assert merged["rewards"] == [[0.0] * 10 + [1.0]]
+        assert merged["is_last_step"] == [True]
+
+    def test_short_response_suffix_does_not_merge(self):
+        """A short coincidental suffix match is not enough to alter training data."""
+        tid = _make_tid("short_suffix")
+        gen_out: GeneratorOutput = {
+            "prompt_token_ids": [[10], [10, 22, 23, 30]],
+            "response_ids": [[100, 101, 22, 23], [40]],
+            "rewards": [[0.0] * 4, [1.0]],
+            "loss_masks": [[1] * 4, [1]],
+            "stop_reasons": ["continue", "eos"],
+            "rollout_metrics": None,
+            "rollout_logprobs": None,
+            "trajectory_ids": [tid, tid],
+            "rollout_expert_indices": None,
+            "is_last_step": [False, True],
+        }
+
+        merged = merge_stepwise_output(gen_out)
+
+        assert merged["prompt_token_ids"] == [[10], [10, 22, 23, 30]]
+        assert merged["response_ids"] == [[100, 101, 22, 23], [40]]
 
     def test_prefix_of_prompt_plus_response_but_not_prompt_alone_no_merge(self):
         """prompt[i]+response[i] is a prefix of prompt[i+1]+response[i+1] but NOT

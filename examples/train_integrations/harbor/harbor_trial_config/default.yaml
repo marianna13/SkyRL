@@ -41,6 +41,11 @@ agent:
     # Suppress Harbor override warnings for max_turns
     suppress_max_turns_warning: true
 
+    # Retry an unsalvageable response that reaches the output-token limit this
+    # many times. Warning modes: none, final (only when giving up), or all.
+    output_length_retries: 1
+    output_length_warning_mode: final
+
     # Whether to enable context summarization when approaching token limits
     enable_summarize: false
 

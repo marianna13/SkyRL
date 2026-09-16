@@ -58,6 +58,16 @@ class EngineConfig(BaseModel):
         ),
         json_schema_extra={"argparse_type": lambda v: None if v == "None" else int(v)},
     )
+    forwarding_inference_timeout_sec: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "Timeout in seconds for a sample request forwarded to the "
+            "SkyRL-Train-managed inference router. This must cover queueing "
+            "and generation time; long TTT rollouts can require substantially "
+            "more than the 900-second default."
+        ),
+    )
     session_cleanup_interval_sec: int = Field(
         default=60,
         description="How often to check for stale sessions (seconds). Set to -1 to disable cleanup.",

@@ -9,6 +9,14 @@ the rest of the codebase still works in CPU-only (no megatron-bridge) environmen
 """
 
 try:
+    # Keep Grug registration independent from the optional architecture imports
+    # below. Older Megatron-Bridge builds may lack Qwen3.5, but can still support
+    # the Grug bridge.
+    import skyrl.backends.skyrl_train.workers.megatron.grug_bridge as _grug_bridge  # noqa: F401
+except ImportError:
+    _grug_bridge = None
+
+try:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
