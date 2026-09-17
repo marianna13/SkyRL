@@ -1,3 +1,5 @@
+from tempfile import TemporaryDirectory
+
 import torch
 
 from skyrl.models.grug import (
@@ -35,16 +37,50 @@ def snowball_config(**overrides) -> GrugMoeConfig:
 
 def test_snowball_config_aliases_and_attention_pattern() -> None:
     config = snowball_config()
+    expected_attention_pattern = [
+        "full_attention" if is_long else "sliding_attention" for is_long in grug_long_layer_flags(26)
+    ]
 
     assert config.model_type == "grug_moe"
     assert config.intermediate_size == config.moe_intermediate_size == 1280
     assert config.num_local_experts == config.num_experts == 256
     assert config.num_experts_per_token == config.num_experts_per_tok == 4
     assert config.attention_head_dim == config.head_dim == 128
-    assert config.layer_types == [
+    assert config.grug_attention_layer_types == expected_attention_pattern
+    assert config.layer_types == ["attention"] * 26
+    assert [index for index, is_long in enumerate(grug_long_layer_flags(26)) if is_long] == [3, 7, 11, 15, 19, 23, 25]
+
+
+def test_snowball_normalizes_legacy_layer_types_for_vllm() -> None:
+    legacy_attention_pattern = [
         "full_attention" if is_long else "sliding_attention" for is_long in grug_long_layer_flags(26)
     ]
-    assert [index for index, is_long in enumerate(grug_long_layer_flags(26)) if is_long] == [3, 7, 11, 15, 19, 23, 25]
+
+    config = snowball_config(layer_types=legacy_attention_pattern)
+
+    assert config.grug_attention_layer_types == legacy_attention_pattern
+    assert config.layer_types == ["attention"] * 26
+
+
+def test_snowball_config_round_trip_preserves_vllm_attention_marker() -> None:
+    config = snowball_config()
+
+    with TemporaryDirectory() as directory:
+        config.save_pretrained(directory)
+        reloaded = GrugMoeConfig.from_pretrained(directory)
+
+    assert reloaded.layer_types == ["attention"] * 26
+    assert reloaded.grug_attention_layer_types == config.grug_attention_layer_types
+
+
+def test_stateful_grug_keeps_hybrid_layer_markers() -> None:
+    config = snowball_config(
+        grugmoe_artifact_schema_version=2,
+        sconv=True,
+    )
+
+    assert config.layer_types == config.grug_attention_layer_types
+    assert any(layer_type != "attention" for layer_type in config.layer_types)
 
 
 def test_jax_top_k_prefers_lower_expert_index_on_ties() -> None:

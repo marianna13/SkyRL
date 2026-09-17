@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ import skyrl.backends.skyrl_train.workers.megatron.grug_bridge as grug_bridge_mo
 from skyrl.backends.skyrl_train.workers.megatron.grug_bridge import (
     GrugModelProvider,
     GrugMoeBridge,
+    _accumulate_grug_stacked_gated_export,
 )
 from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
     MegatronWeightExtractor,
@@ -132,3 +135,40 @@ def test_grug_weight_sync_preserves_router_bias_fp32() -> None:
     metadata = extractor.get_weight_metadata(torch.bfloat16)
 
     assert metadata["dtype_names"] == ["bfloat16", "float32"]
+
+
+def test_grug_grouped_export_keeps_gate_and_up_separate() -> None:
+    gate_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    up_name = "model.layers.0.mlp.experts.up_proj.weight"
+    mapping = SimpleNamespace(
+        hf_param={"gate": gate_name, "up": up_name},
+        ep_size=2,
+        group_key="model.layers.0.mlp.experts.gate_up",
+    )
+    model_config = SimpleNamespace(num_moe_experts=4)
+    buffers: dict[str, dict[int, torch.Tensor]] = {}
+
+    first = _accumulate_grug_stacked_gated_export(
+        SimpleNamespace(mapping=mapping, param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0"),
+        {
+            gate_name: torch.tensor([[[10.0]], [[30.0]]]),
+            up_name: torch.tensor([[[110.0]], [[130.0]]]),
+        },
+        model_config,
+        buffers,
+    )
+    second = _accumulate_grug_stacked_gated_export(
+        SimpleNamespace(mapping=mapping, param_name="decoder.layers.0.mlp.experts.linear_fc1.weight1"),
+        {
+            gate_name: torch.tensor([[[20.0]], [[40.0]]]),
+            up_name: torch.tensor([[[120.0]], [[140.0]]]),
+        },
+        model_config,
+        buffers,
+    )
+
+    assert first is None
+    assert set(second) == {gate_name, up_name}
+    assert second[gate_name].flatten().tolist() == [10.0, 20.0, 30.0, 40.0]
+    assert second[up_name].flatten().tolist() == [110.0, 120.0, 130.0, 140.0]
+    assert buffers == {}

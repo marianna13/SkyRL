@@ -124,6 +124,7 @@ class GrugMoeConfig(PretrainedConfig):
         sliding_window: int | None = None,
         global_every: int = _FULL_ATTENTION_INTERVAL,
         layer_types: list[str] | None = None,
+        grug_attention_layer_types: list[str] | None = None,
         layer_norm_eps: float | None = None,
         rms_norm_eps: float | None = None,
         initializer_std: float | None = None,
@@ -175,8 +176,18 @@ class GrugMoeConfig(PretrainedConfig):
         if global_every <= 0:
             raise ValueError("global_every must be positive")
         resolved_layer_types = grug_moe_layer_types(num_hidden_layers, global_every)
-        if layer_types is not None and layer_types != resolved_layer_types:
-            raise ValueError("layer_types must match the GrugMoE attention architecture")
+        attention_only_layer_types = ["attention"] * num_hidden_layers
+        transformers_attention_only_layer_types = ["full_attention"] * num_hidden_layers
+        if layer_types is not None and layer_types not in (
+            resolved_layer_types,
+            attention_only_layer_types,
+            transformers_attention_only_layer_types,
+        ):
+            raise ValueError(
+                "layer_types must contain either the legacy GrugMoE attention " "pattern or vLLM attention-only markers"
+            )
+        if grug_attention_layer_types is not None and grug_attention_layer_types != resolved_layer_types:
+            raise ValueError("grug_attention_layer_types must match the GrugMoE attention architecture")
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -205,7 +216,13 @@ class GrugMoeConfig(PretrainedConfig):
         self.max_seq_len = max_position_embeddings
         self.sliding_window = int(_coalesce(sliding_window, max_position_embeddings))
         self.global_every = global_every
-        self.layer_types = resolved_layer_types
+        # vLLM reserves ``layer_types`` for deciding whether a model has
+        # recurrent/Mamba state. Grug's full-vs-sliding distinction describes
+        # two kinds of attention and must live in separate metadata. Without
+        # this normalization schema-1 Snowball is incorrectly treated as a
+        # hybrid Mamba model and generation fails while allocating Mamba state.
+        self.grug_attention_layer_types = resolved_layer_types
+        self.layer_types = resolved_layer_types if bool(sconv) else attention_only_layer_types
         self.rms_norm_eps = float(_coalesce(rms_norm_eps, layer_norm_eps, 1e-5))
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range = float(_coalesce(initializer_range, initializer_std, 0.02))
@@ -271,6 +288,13 @@ class GrugMoeConfig(PretrainedConfig):
             raise ValueError("unsupported sconv_sites: " + ", ".join(sorted(unknown_sconv_sites)))
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        if not self.sconv:
+            # transformers>=5 remaps the legacy ``attention`` marker to
+            # ``full_attention`` while validating PretrainedConfig. Restore it
+            # after validation because vLLM 0.27 specifically uses
+            # ``attention`` to identify an attention-only specialization of a
+            # model class that is also capable of recurrent state.
+            self.layer_types = attention_only_layer_types
 
 
 __all__ = [

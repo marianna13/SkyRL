@@ -150,6 +150,64 @@ class GrugStackedGatedExpertMapping(_StackedExpertExport, GatedMLPMapping):
         return super().hf_to_megatron(sliced, megatron_module)
 
 
+def _accumulate_grug_stacked_gated_export(
+    task,
+    converted_weights_dict: dict[str, torch.Tensor],
+    model_config,
+    grouped_buffers: dict[str, dict[int, torch.Tensor]],
+) -> dict[str, torch.Tensor] | None:
+    """Accumulate Grug's gate and up projections without conflating them.
+
+    Megatron-Bridge's generic grouped-export helper assumes that one mapping
+    produces one HF tensor. ``GatedMLPMapping`` produces two tensors instead.
+    Using the generic helper stores both under the same expert key, so the up
+    projection overwrites the gate projection and the eventual weight name is
+    the string representation of ``{"gate": ..., "up": ...}``.
+
+    Keep independent per-projection buffers and emit the two stacked Snowball
+    tensors only after every expert has arrived.
+    """
+
+    mapping = task.mapping
+    projection_names = mapping.hf_param
+    ep_size = mapping.ep_size
+    num_experts = model_config.num_moe_experts
+    experts_per_rank = num_experts // ep_size
+    local_expert = extract_expert_number_from_param(task.param_name) % experts_per_rank
+
+    buffer_keys: dict[str, str] = {}
+    for projection in ("gate", "up"):
+        hf_name = projection_names[projection]
+        if hf_name not in converted_weights_dict:
+            raise ValueError(f"Grug grouped export is missing {projection!r} tensor {hf_name!r}")
+
+        buffer_key = f"{mapping.group_key}:{projection}"
+        buffer_keys[projection] = buffer_key
+        projection_buffer = grouped_buffers.setdefault(buffer_key, {})
+        value = converted_weights_dict[hf_name]
+
+        if ep_size > 1 and value.ndim > 0 and value.shape[0] == ep_size:
+            for ep_rank in range(ep_size):
+                global_expert = local_expert + ep_rank * experts_per_rank
+                projection_buffer[global_expert] = value[ep_rank]
+        else:
+            projection_buffer[local_expert] = value
+
+    if any(len(grouped_buffers[key]) != num_experts for key in buffer_keys.values()):
+        return None
+
+    result = {
+        projection_names[projection]: torch.stack(
+            [grouped_buffers[buffer_keys[projection]][expert] for expert in range(num_experts)],
+            dim=0,
+        )
+        for projection in ("gate", "up")
+    }
+    for buffer_key in buffer_keys.values():
+        del grouped_buffers[buffer_key]
+    return result
+
+
 def _gated_norm_mappings(megatron_prefix: str, hf_norm: str, hf_gate_prefix: str) -> list[ReplicatedMapping]:
     return [
         ReplicatedMapping(f"{megatron_prefix}.norm.weight", hf_norm),
@@ -166,6 +224,29 @@ def _gated_norm_mappings(megatron_prefix: str, hf_norm: str, hf_gate_prefix: str
 )
 class GrugMoeBridge(MegatronModelBridge):
     """Convert Grug MoE HF checkpoints to and from the Megatron-Core model."""
+
+    def _accumulate_grouped_export(
+        self,
+        task,
+        converted_weights_dict,
+        model_config,
+        grouped_buffers,
+        hf_state_dict,
+    ):
+        if isinstance(task.mapping, GrugStackedGatedExpertMapping):
+            return _accumulate_grug_stacked_gated_export(
+                task,
+                converted_weights_dict,
+                model_config,
+                grouped_buffers,
+            )
+        return super()._accumulate_grouped_export(
+            task,
+            converted_weights_dict,
+            model_config,
+            grouped_buffers,
+            hf_state_dict,
+        )
 
     def provider_bridge(self, hf_pretrained) -> GrugModelProvider:
         provider = super().provider_bridge(hf_pretrained)
