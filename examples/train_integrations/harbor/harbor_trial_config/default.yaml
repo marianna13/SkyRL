@@ -45,6 +45,9 @@ agent:
     # many times. Warning modes: none, final (only when giving up), or all.
     output_length_retries: 1
     output_length_warning_mode: final
+    # Opt-in debugging aid: retain this many characters from capped responses
+    # in result metadata. Invalid responses are never added to rollout details.
+    output_length_preview_chars: 0
 
     # Whether to enable context summarization when approaching token limits
     enable_summarize: false

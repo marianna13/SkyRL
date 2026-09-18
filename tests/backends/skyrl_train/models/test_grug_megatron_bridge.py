@@ -13,6 +13,7 @@ from skyrl.backends.skyrl_train.workers.megatron.grug_bridge import (
     GrugMoeBridge,
     _accumulate_grug_stacked_gated_export,
 )
+from skyrl.backends.skyrl_train.workers.megatron.grug_model import GrugTopKRouter
 from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
     MegatronWeightExtractor,
 )
@@ -100,7 +101,9 @@ def test_bridge_covers_every_snowball_weight_family() -> None:
         "lm_head.weight",
     ]
 
-    missing = [name for name in weight_names if registry.hf_to_megatron_lookup(name) is None]
+    missing = [
+        name for name in weight_names if registry.hf_to_megatron_lookup(name) is None
+    ]
 
     assert missing == []
 
@@ -149,7 +152,10 @@ def test_grug_grouped_export_keeps_gate_and_up_separate() -> None:
     buffers: dict[str, dict[int, torch.Tensor]] = {}
 
     first = _accumulate_grug_stacked_gated_export(
-        SimpleNamespace(mapping=mapping, param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0"),
+        SimpleNamespace(
+            mapping=mapping,
+            param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        ),
         {
             gate_name: torch.tensor([[[10.0]], [[30.0]]]),
             up_name: torch.tensor([[[110.0]], [[130.0]]]),
@@ -158,7 +164,10 @@ def test_grug_grouped_export_keeps_gate_and_up_separate() -> None:
         buffers,
     )
     second = _accumulate_grug_stacked_gated_export(
-        SimpleNamespace(mapping=mapping, param_name="decoder.layers.0.mlp.experts.linear_fc1.weight1"),
+        SimpleNamespace(
+            mapping=mapping,
+            param_name="decoder.layers.0.mlp.experts.linear_fc1.weight1",
+        ),
         {
             gate_name: torch.tensor([[[20.0]], [[40.0]]]),
             up_name: torch.tensor([[[120.0]], [[140.0]]]),
@@ -172,3 +181,32 @@ def test_grug_grouped_export_keeps_gate_and_up_separate() -> None:
     assert second[gate_name].flatten().tolist() == [10.0, 20.0, 30.0, 40.0]
     assert second[up_name].flatten().tolist() == [110.0, 120.0, 130.0, 140.0]
     assert buffers == {}
+
+
+def test_grug_router_uses_router_replay_selection() -> None:
+    class FakeReplay:
+        def __init__(self, selected: torch.Tensor):
+            self.selected = selected
+            self.called = False
+
+        def get_replay_topk(self, scores, topk, **kwargs):
+            del topk, kwargs
+            self.called = True
+            return scores.gather(1, self.selected), self.selected
+
+    replay = FakeReplay(torch.tensor([[3, 1], [2, 0]]))
+    router = SimpleNamespace(
+        config=SimpleNamespace(num_moe_experts=4),
+        expert_bias=torch.zeros(4),
+        topk=2,
+        router_replay=replay,
+    )
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+
+    _, routing_map = GrugTopKRouter.routing(router, logits)
+
+    assert replay.called
+    assert routing_map.tolist() == [
+        [False, True, False, True],
+        [True, False, True, False],
+    ]

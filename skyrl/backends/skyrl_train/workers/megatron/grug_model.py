@@ -54,7 +54,9 @@ from skyrl.models.grug import (
 )
 
 
-def _first_present(preferred: torch.Tensor | None, fallback: torch.Tensor | None) -> torch.Tensor | None:
+def _first_present(
+    preferred: torch.Tensor | None, fallback: torch.Tensor | None
+) -> torch.Tensor | None:
     return fallback if preferred is None else preferred
 
 
@@ -128,7 +130,9 @@ class GrugSelfAttention(SelfAttention):
             tp_group=self.pg_collection.tp,
         )
         is_long = grug_long_layer_flags(config.num_layers)[layer_number - 1]
-        self.query_scale = config.grug_qk_mult * (config.grug_qk_mult_long_scale if is_long else 1.0)
+        self.query_scale = config.grug_qk_mult * (
+            config.grug_qk_mult_long_scale if is_long else 1.0
+        )
         self.skip_rope = bool(config.no_rope_freq[layer_number - 1])
 
     def forward(
@@ -148,11 +152,21 @@ class GrugSelfAttention(SelfAttention):
         inference_params=None,
     ):
         if inference_context is not None or inference_params is not None:
-            raise NotImplementedError("GrugSelfAttention only supports training forwards")
-        if rotary_pos_cos is not None or rotary_pos_sin is not None or rotary_pos_cos_sin is not None:
-            raise NotImplementedError("GrugSelfAttention applies RoPE from rotary_pos_emb only")
+            raise NotImplementedError(
+                "GrugSelfAttention only supports training forwards"
+            )
+        if (
+            rotary_pos_cos is not None
+            or rotary_pos_sin is not None
+            or rotary_pos_cos_sin is not None
+        ):
+            raise NotImplementedError(
+                "GrugSelfAttention applies RoPE from rotary_pos_emb only"
+            )
 
-        query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        query, key, value = self.get_query_key_value_tensors(
+            hidden_states, key_value_states
+        )
 
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         if is_thd:
@@ -222,7 +236,9 @@ class GrugSelfAttention(SelfAttention):
         output, bias = apply_module(self.linear_proj)(core_attn_out)
         return output, bias
 
-    def _apply_xsa(self, core_attn_out: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    def _apply_xsa(
+        self, core_attn_out: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
         """Remove each head's component along its (GQA-expanded) value vector."""
 
         heads = core_attn_out.view(
@@ -231,7 +247,8 @@ class GrugSelfAttention(SelfAttention):
             self.hidden_size_per_attention_head,
         )
         expanded_value = value.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            self.num_attention_heads_per_partition
+            // self.num_query_groups_per_partition,
             dim=-2,
         )
         out = heads.float()
@@ -241,11 +258,15 @@ class GrugSelfAttention(SelfAttention):
         out = out - (dot / (v_norm + GRUG_XSA_EPS)) * v
         return out.to(core_attn_out.dtype).reshape(core_attn_out.shape)
 
-    def _apply_head_gate(self, core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def _apply_head_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
         """Scale every head by ``2 * sigmoid(attn_gate(x))``."""
 
         heads = core_attn_out.view(*gate.shape, self.hidden_size_per_attention_head)
-        gated = heads * (GRUG_ATTN_GATE_SCALE * torch.sigmoid(gate.float())).unsqueeze(-1).to(heads.dtype)
+        gated = heads * (GRUG_ATTN_GATE_SCALE * torch.sigmoid(gate.float())).unsqueeze(
+            -1
+        ).to(heads.dtype)
         return gated.reshape(core_attn_out.shape)
 
 
@@ -257,19 +278,47 @@ class GrugTopKRouter(TopKRouter):
     logits of the first ``k`` selected experts.
     """
 
-    def __init__(self, config: TransformerConfig, pg_collection=None, is_mtp_layer: bool = False):
-        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
-        assert self.enable_expert_bias, "GrugTopKRouter requires moe_router_enable_expert_bias=True"
+    def __init__(
+        self, config: TransformerConfig, pg_collection=None, is_mtp_layer: bool = False
+    ):
+        super().__init__(
+            config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
+        assert self.enable_expert_bias, (
+            "GrugTopKRouter requires moe_router_enable_expert_bias=True"
+        )
 
     def routing(self, logits: torch.Tensor, padding_mask: torch.Tensor | None = None):
         logits = logits.view(-1, self.config.num_moe_experts).float()
         biased_logits = logits + self.expert_bias
-        _, topk_indices = jax_top_k(biased_logits, self.topk + 1)
-        selected = topk_indices[:, : self.topk]
+
+        def select_grug_topk(scores, topk, num_groups=None, group_topk=None):
+            del num_groups, group_topk
+            _, topk_indices = jax_top_k(scores, topk + 1)
+            selected_indices = topk_indices[:, :topk]
+            return torch.gather(
+                scores, dim=-1, index=selected_indices
+            ), selected_indices
+
+        if self.router_replay is None:
+            _, selected = select_grug_topk(biased_logits, self.topk)
+        else:
+            # Record/replay only the k experts Grug actually dispatches to. The
+            # extra (k+1) candidate is a selection detail and has no combine weight.
+            _, selected = self.router_replay.get_replay_topk(
+                biased_logits,
+                self.topk,
+                default_compute_topk=select_grug_topk,
+            )
         combine = torch.sigmoid(torch.gather(logits, dim=-1, index=selected))
-        combine = combine * (GRUG_ROUTING_RENORM_SUM / (combine.sum(dim=-1, keepdim=True) + GRUG_ROUTER_RENORM_EPS))
+        combine = combine * (
+            GRUG_ROUTING_RENORM_SUM
+            / (combine.sum(dim=-1, keepdim=True) + GRUG_ROUTER_RENORM_EPS)
+        )
         probs = torch.zeros_like(logits).scatter(1, selected, combine)
-        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, selected, True)
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+            1, selected, True
+        )
         return probs, routing_map
 
     def forward(self, input: torch.Tensor, padding_mask: torch.Tensor | None = None):
@@ -318,7 +367,9 @@ def grug_layer_spec(config: TransformerConfig) -> ModuleSpec:
     """Build the Transformer Engine layer spec for one Grug decoder layer."""
 
     backend = TESpecProvider()
-    moe = get_moe_module_spec_for_backend(backend, num_experts=config.num_moe_experts, moe_grouped_gemm=True)
+    moe = get_moe_module_spec_for_backend(
+        backend, num_experts=config.num_moe_experts, moe_grouped_gemm=True
+    )
     moe.keywords["submodules"].router = GrugTopKRouter
     return ModuleSpec(
         module=TransformerLayer,
@@ -343,12 +394,16 @@ def grug_layer_spec(config: TransformerConfig) -> ModuleSpec:
     )
 
 
-def grug_block_spec(config: TransformerConfig, vp_stage: int | None, pp_rank: int) -> ModuleSpec:
+def grug_block_spec(
+    config: TransformerConfig, vp_stage: int | None, pp_rank: int
+) -> ModuleSpec:
     """Build this pipeline stage's decoder block spec with Grug's gated final norm."""
 
     layer_spec = grug_layer_spec(config)
     num_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     return ModuleSpec(
         module=TransformerBlock,
-        submodules=TransformerBlockSubmodules(layer_specs=[layer_spec] * num_layers, layer_norm=GrugGatedRMSNorm),
+        submodules=TransformerBlockSubmodules(
+            layer_specs=[layer_spec] * num_layers, layer_norm=GrugGatedRMSNorm
+        ),
     )

@@ -32,14 +32,18 @@ def make_router_padding_mask(
     from router accounting.
     """
     if attention_mask.ndim != 2:
-        raise ValueError(f"Expected 2D attention_mask, got shape {attention_mask.shape}")
+        raise ValueError(
+            f"Expected 2D attention_mask, got shape {attention_mask.shape}"
+        )
     if len(captured_route_lengths) != attention_mask.shape[0]:
         raise ValueError(
             f"Expected one captured route length per trajectory, got {len(captured_route_lengths)} "
             f"for batch size {attention_mask.shape[0]}"
         )
 
-    captured = torch.as_tensor(captured_route_lengths, dtype=torch.long, device=attention_mask.device)
+    captured = torch.as_tensor(
+        captured_route_lengths, dtype=torch.long, device=attention_mask.device
+    )
     sequence_lengths = attention_mask.sum(dim=1, dtype=torch.long)
     if torch.any(captured < 0) or torch.any(captured > sequence_lengths):
         raise ValueError(
@@ -48,7 +52,9 @@ def make_router_padding_mask(
         )
 
     sequence_starts = attention_mask.shape[1] - sequence_lengths
-    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device).unsqueeze(0)
+    positions = torch.arange(
+        attention_mask.shape[1], device=attention_mask.device
+    ).unsqueeze(0)
     captured_positions = (positions >= sequence_starts.unsqueeze(1)) & (
         positions < (sequence_starts + captured).unsqueeze(1)
     )
@@ -61,29 +67,37 @@ def _verify_inputs(
     rewards: Optional[List[Union[List[float], torch.Tensor]]],
     loss_masks: List[List[int]],
 ):
-    assert (
-        len(prompts) == len(responses) and len(prompts) > 0
-    ), "prompts and responses must have the same length and length must be greater than 0, got {} and {}".format(
-        len(prompts), len(responses)
+    assert len(prompts) == len(responses) and len(prompts) > 0, (
+        "prompts and responses must have the same length and length must be greater than 0, got {} and {}".format(
+            len(prompts), len(responses)
+        )
     )
 
     if rewards is not None:
-        assert len(rewards) == len(prompts), "rewards must have the same length as prompts, got {} and {}".format(
-            len(rewards), len(prompts)
+        assert len(rewards) == len(prompts), (
+            "rewards must have the same length as prompts, got {} and {}".format(
+                len(rewards), len(prompts)
+            )
         )
-    assert len(loss_masks) == len(prompts), "loss_masks must have the same length as prompt, got {} and {}".format(
-        len(loss_masks), len(prompts)
+    assert len(loss_masks) == len(prompts), (
+        "loss_masks must have the same length as prompt, got {} and {}".format(
+            len(loss_masks), len(prompts)
+        )
     )
 
 
 def _reward_to_numpy(custom_reward: Union[List[float], torch.Tensor]) -> np.ndarray:
     if isinstance(custom_reward, torch.Tensor):
-        reward_arr = custom_reward.detach().to(device="cpu", dtype=torch.float32).numpy()
+        reward_arr = (
+            custom_reward.detach().to(device="cpu", dtype=torch.float32).numpy()
+        )
     else:
         reward_arr = np.asarray(custom_reward, dtype=np.float32)
 
     if reward_arr.ndim != 1:
-        raise ValueError(f"Expected a 1D per-token reward sequence, got shape {reward_arr.shape}")
+        raise ValueError(
+            f"Expected a 1D per-token reward sequence, got shape {reward_arr.shape}"
+        )
     return reward_arr
 
 
@@ -233,7 +247,9 @@ def convert_prompts_responses_to_batch_tensors(
         if not isinstance(rollout_expert_indices, list):
             raise TypeError("rollout_expert_indices must be a list of NumPy arrays")
         if len(rollout_expert_indices) != num_samples:
-            raise ValueError("rollout_expert_indices must contain routes for every trajectory")
+            raise ValueError(
+                "rollout_expert_indices must contain routes for every trajectory"
+            )
 
         canonical_indices = []
         for sample_index, sample_indices in enumerate(rollout_expert_indices):
@@ -244,27 +260,46 @@ def convert_prompts_responses_to_batch_tensors(
                 )
             canonical_indices.append(compact_routed_expert_indices(sample_indices))
 
-        first_shape = canonical_indices[0].shape
-        if len(first_shape) != 3 or first_shape[0] == 0:
-            raise ValueError("rollout_expert_indices must contain routes for every trajectory")
-        num_layers, topk = first_shape[1:]
+        shape_source = next(
+            (indices for indices in canonical_indices if indices.shape[1:] != (0, 0)),
+            None,
+        )
+        if shape_source is None:
+            raise ValueError(
+                "rollout_expert_indices contains no successful route payload from which to infer [layers, topk]"
+            )
+        num_layers, topk = shape_source.shape[1:]
         if topk < 1:
-            raise ValueError("rollout_expert_indices must contain at least one expert per layer")
+            raise ValueError(
+                "rollout_expert_indices must contain at least one expert per layer"
+            )
 
-        batch_dtype = max((indices.dtype for indices in canonical_indices), key=lambda dtype: dtype.itemsize)
+        batch_dtype = max(
+            (indices.dtype for indices in canonical_indices),
+            key=lambda dtype: dtype.itemsize,
+        )
         padded = make_replay_padding_indices_np(
             (num_samples, max_total, num_layers, topk),
             dtype=batch_dtype,
         )
         for sample_index, sample_indices in enumerate(canonical_indices):
-            if sample_indices.ndim != 3 or sample_indices.shape[1:] != (num_layers, topk):
+            if sample_indices.shape == (0, 0, 0):
+                # Shape-less sentinel emitted by an entirely failed generation
+                # group. It contributes no rows and is fully router-masked.
+                continue
+            if sample_indices.ndim != 3 or sample_indices.shape[1:] != (
+                num_layers,
+                topk,
+            ):
                 raise ValueError(
                     "rollout_expert_indices entries must share [layers, topk], "
                     f"got shape {sample_indices.shape} at sample {sample_index}"
                 )
-            left_pad = max_total - (prompt_token_lens[sample_index] + response_token_lens[sample_index])
+            left_pad = max_total - (
+                prompt_token_lens[sample_index] + response_token_lens[sample_index]
+            )
             available = max_total - left_pad
-            if sample_indices.shape[0] == 0 or sample_indices.shape[0] > available:
+            if sample_indices.shape[0] > available:
                 raise ValueError(
                     f"Trajectory {sample_index} has {sample_indices.shape[0]} route rows for {available} tokens"
                 )
@@ -302,9 +337,9 @@ def compute_prompt_boundaries(uids: List[str]) -> List[Tuple[int, int]]:
     start = 0
     for i in range(1, len(uids)):
         if uids[i] != uids[i - 1]:
-            assert (
-                uids[i] not in seen_uids
-            ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            assert uids[i] not in seen_uids, (
+                f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            )
             seen_uids.add(uids[i - 1])
             boundaries.append((start, i))
             start = i
@@ -360,9 +395,9 @@ def compute_prompt_mini_batch_boundaries(
     seen_uids.add(uids[0])
     for i in range(1, len(uids)):
         if uids[i] != uids[i - 1]:
-            assert (
-                uids[i] not in seen_uids
-            ), f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            assert uids[i] not in seen_uids, (
+                f"uid {uids[i]!r} appears in non-contiguous positions at index {i}. Full uids: {uids}"
+            )
             seen_uids.add(uids[i])
             prompt_end_indices.append(i)
     prompt_end_indices.append(len(uids))
@@ -376,7 +411,9 @@ def compute_prompt_mini_batch_boundaries(
     boundaries: List[Tuple[int, int]] = []
     start_seq = 0
     for i in range(0, num_prompts, mini_batch_size):
-        end_prompt_idx = i + mini_batch_size - 1  # i + mini_batch_size is next mini-batch's first prompt's end index
+        end_prompt_idx = (
+            i + mini_batch_size - 1
+        )  # i + mini_batch_size is next mini-batch's first prompt's end index
         end_seq = prompt_end_indices[end_prompt_idx]
         boundaries.append((start_seq, end_seq))
         start_seq = end_seq

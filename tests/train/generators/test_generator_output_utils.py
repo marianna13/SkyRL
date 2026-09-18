@@ -71,7 +71,12 @@ def test_generator_output_concatenation():
     assert concatenated_output["rewards"] == [1.0, 2.0, 2.0, 3.0]
     assert concatenated_output["loss_masks"] == [[1, 1], [1, 1], [1, 1, 1], [1]]
     assert concatenated_output["stop_reasons"] == ["stop", "stop", "stop", "stop"]
-    assert concatenated_output["rollout_logprobs"] == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6, 0.7], [0.8]]
+    assert concatenated_output["rollout_logprobs"] == [
+        [0.1, 0.2],
+        [0.3, 0.4],
+        [0.5, 0.6, 0.7],
+        [0.8],
+    ]
 
     # Validate rollout metrics
     expected_rollout_metrics = {
@@ -90,7 +95,9 @@ def test_generator_output_concatenation():
         "generate/tokens_per_turn_std": np.std([2, 2, 3, 1]).item(),
         "generate/tokens_per_turn_max": 3,
     }
-    assert concatenated_output["rollout_metrics"].keys() == expected_rollout_metrics.keys()
+    assert (
+        concatenated_output["rollout_metrics"].keys() == expected_rollout_metrics.keys()
+    )
     for key, value in expected_rollout_metrics.items():
         np.testing.assert_allclose(concatenated_output["rollout_metrics"][key], value)
 
@@ -125,10 +132,15 @@ def test_time_split_rollout_metrics():
         responses=[[1, 2]] * 4,
         rewards=[1.0] * 4,
         trajectory_completion_times=[10.0, 20.0, 30.0, 40.0],
-        trajectory_time_splits={"llm": [4.0, 8.0, 12.0, 16.0], "env": [5.0, 10.0, 15.0, 20.0]},
+        trajectory_time_splits={
+            "llm": [4.0, 8.0, 12.0, 16.0],
+            "env": [5.0, 10.0, 15.0, 20.0],
+        },
     )
     assert metrics["generate/trajectory_time_llm_mean"] == 10.0
-    assert metrics["generate/trajectory_time_llm_p90"] == pytest.approx(np.percentile([4.0, 8.0, 12.0, 16.0], 90))
+    assert metrics["generate/trajectory_time_llm_p90"] == pytest.approx(
+        np.percentile([4.0, 8.0, 12.0, 16.0], 90)
+    )
     assert metrics["generate/trajectory_time_llm_max"] == 16.0
     assert metrics["generate/trajectory_time_env_mean"] == 12.5
     # "other" is the exact per-trajectory remainder, here [1.0, 2.0, 3.0, 4.0].
@@ -153,7 +165,10 @@ def test_time_splits_concatenation():
     out2 = make_output([30.0, 40.0], {"llm": [12.0, 16.0], "env": [15.0, 20.0]})
     concatenated = concatenate_generator_outputs([out1, out2])
 
-    assert concatenated["trajectory_time_splits"] == {"llm": [4.0, 8.0, 12.0, 16.0], "env": [5.0, 10.0, 15.0, 20.0]}
+    assert concatenated["trajectory_time_splits"] == {
+        "llm": [4.0, 8.0, 12.0, 16.0],
+        "env": [5.0, 10.0, 15.0, 20.0],
+    }
     # Aggregates are recomputed over the combined sample, not combined from per-group aggregates.
     concat_metrics = concatenated["rollout_metrics"]
     assert concat_metrics["generate/trajectory_time_llm_p90"] == pytest.approx(
@@ -184,7 +199,12 @@ def test_time_splits_concatenation_partial_is_none():
         concatenated = concatenate_generator_outputs(outputs)
         assert concatenated["trajectory_time_splits"] is None
         # generation_times has its own None-ness, so it still concatenates fully.
-        assert sorted(concatenated["trajectory_generation_times"]) == [10.0, 20.0, 30.0, 40.0]
+        assert sorted(concatenated["trajectory_generation_times"]) == [
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+        ]
 
 
 def test_get_metrics_from_generator_output():
@@ -623,7 +643,9 @@ class TestMergeStepwiseOutput:
         assert merged["prompt_token_ids"] == [[10]]
         assert merged["response_ids"] == [visible + [30, 31, 40]]
         assert merged["loss_masks"] == [[1] * 8 + [0, 0, 1]]
-        assert merged["rollout_logprobs"] == [[-3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, 0.0, 0.0, -12.0]]
+        assert merged["rollout_logprobs"] == [
+            [-3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, 0.0, 0.0, -12.0]
+        ]
         assert merged["rewards"] == [[0.0] * 10 + [1.0]]
         assert merged["is_last_step"] == [True]
 
@@ -701,8 +723,20 @@ class TestMergeStepwiseOutput:
             "prompt_token_ids": [
                 [1],  # turn 1
                 [1, 2, 3],  # turn 2: prompt[0]+resp[0]=[1,2] is prefix of [1,2,3] ✓
-                [1, 23, 4, 5],  # turn 3: prompt[1]+resp[1]=[1,2,3,4] is NOT prefix of [1,23,4,5] ✗
-                [1, 23, 4, 5, 6, 7],  # turn 4: prompt[2]+resp[2]=[1,23,4,5,6] is prefix ✓
+                [
+                    1,
+                    23,
+                    4,
+                    5,
+                ],  # turn 3: prompt[1]+resp[1]=[1,2,3,4] is NOT prefix of [1,23,4,5] ✗
+                [
+                    1,
+                    23,
+                    4,
+                    5,
+                    6,
+                    7,
+                ],  # turn 4: prompt[2]+resp[2]=[1,23,4,5,6] is prefix ✓
             ],
             "response_ids": [
                 [2],  # turn 1
@@ -783,23 +817,60 @@ class TestMergeStepwiseOutput:
         with pytest.raises(TypeError):
             merge_stepwise_output(gen_out)
 
-    def test_asserts_no_expert_indices(self):
-        """Raises when rollout_expert_indices is present."""
+    def test_merges_with_last_turn_expert_indices(self):
+        """Exact-prefix merging keeps the final turn's full-stream routes."""
         tid = _make_tid("x")
+        turn_one_routes = np.asarray([[[1, 2]]], dtype=np.uint8)
+        turn_two_routes = np.asarray([[[3, 4]], [[5, 6]], [[7, 8]]], dtype=np.uint8)
         gen_out: GeneratorOutput = {
-            "prompt_token_ids": [[1]],
-            "response_ids": [[2]],
-            "rewards": [[1.0]],
-            "loss_masks": [[1]],
-            "stop_reasons": None,
+            "prompt_token_ids": [[1], [1, 2, 3]],
+            "response_ids": [[2], [4]],
+            "rewards": [[0.0], [1.0]],
+            "loss_masks": [[1], [1]],
+            "stop_reasons": ["continue", "eos"],
+            "rollout_metrics": None,
+            "rollout_logprobs": [[-0.1], [-0.2]],
+            "trajectory_ids": [tid, tid],
+            "rollout_expert_indices": [turn_one_routes, turn_two_routes],
+            "is_last_step": [False, True],
+        }
+
+        merged = merge_stepwise_output(gen_out)
+
+        assert merged["prompt_token_ids"] == [[1]]
+        assert merged["response_ids"] == [[2, 3, 4]]
+        assert len(merged["rollout_expert_indices"]) == 1
+        np.testing.assert_array_equal(
+            merged["rollout_expert_indices"][0], turn_two_routes
+        )
+
+    def test_routes_disable_hidden_reasoning_suffix_merge(self):
+        """Deleting reasoning tokens would misalign R3, so routed turns remain separate."""
+        tid = _make_tid("r3_reasoning_stripped")
+        hidden = [100, 101, 102]
+        visible = [20, 21, 22, 23, 24, 25, 26, 27]
+        first_routes = np.zeros((len(hidden) + len(visible), 1, 2), dtype=np.uint8)
+        second_routes = np.ones((len(visible) + 2, 1, 2), dtype=np.uint8)
+        gen_out: GeneratorOutput = {
+            "prompt_token_ids": [[10], [10] + visible + [30, 31]],
+            "response_ids": [hidden + visible, [40]],
+            "rewards": [[0.0] * 11, [1.0]],
+            "loss_masks": [[1] * 11, [1]],
+            "stop_reasons": ["continue", "eos"],
             "rollout_metrics": None,
             "rollout_logprobs": None,
-            "trajectory_ids": [tid],
-            "rollout_expert_indices": [np.asarray([[[1, 2]]], dtype=np.uint8)],
-            "is_last_step": [True],
+            "trajectory_ids": [tid, tid],
+            "rollout_expert_indices": [first_routes, second_routes],
+            "is_last_step": [False, True],
         }
-        with pytest.raises(AssertionError, match="rollout_expert_indices not supported"):
-            merge_stepwise_output(gen_out)
+
+        merged = merge_stepwise_output(gen_out)
+
+        assert merged["response_ids"] == [hidden + visible, [40]]
+        np.testing.assert_array_equal(merged["rollout_expert_indices"][0], first_routes)
+        np.testing.assert_array_equal(
+            merged["rollout_expert_indices"][1], second_routes
+        )
 
     # ─── Config validation ─────────────────────────────────────────
 
@@ -815,7 +886,9 @@ class TestMergeStepwiseOutput:
         cfg = example_dummy_config()
         cfg.generator.merge_stepwise_output = True
         cfg.generator.step_wise_trajectories = False
-        with pytest.raises(ValueError, match="merge_stepwise_output.*requires.*step_wise_trajectories"):
+        with pytest.raises(
+            ValueError, match="merge_stepwise_output.*requires.*step_wise_trajectories"
+        ):
             validate_cfg(cfg)
 
 

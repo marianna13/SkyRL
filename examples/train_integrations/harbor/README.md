@@ -13,9 +13,9 @@ examples/train_integrations/harbor/
     default.yaml                   # Harbor TrialConfig template
   entrypoints/
     main_harbor.py                 # Full training entrypoint
-    main_harbor_generate.py        # Generation-only debug entrypoint
+    main_harbor_generate.py        # Full-dataset evaluation-only entrypoint
   run_codecontest.sh               # Code contest training (Qwen3-8B)
-  run_harbor_gen.sh                # Debug generation-only
+  run_harbor_gen.sh                # Evaluation-only rollout launcher
 ```
 
 ### Quick Start

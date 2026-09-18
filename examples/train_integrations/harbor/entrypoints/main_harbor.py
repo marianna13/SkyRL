@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 import numpy as np
 import ray
@@ -28,7 +28,9 @@ from ..reward_shaping import HarborRewardShapingConfig
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
-HARBOR_DEFAULT_CONFIG = Path(__file__).parent.parent / "harbor_trial_config" / "default.yaml"
+HARBOR_DEFAULT_CONFIG = (
+    Path(__file__).parent.parent / "harbor_trial_config" / "default.yaml"
+)
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -46,7 +48,11 @@ class HarborGeneratorConfig(GeneratorConfig):
     """GeneratorConfig with Harbor-specific rate limiting."""
 
     rate_limit: RateLimiterConfig = field(default_factory=RateLimiterConfig)
-    reward_shaping: HarborRewardShapingConfig = field(default_factory=HarborRewardShapingConfig)
+    reward_shaping: HarborRewardShapingConfig = field(
+        default_factory=HarborRewardShapingConfig
+    )
+    harbor_trajectory_mode: Literal["step_wise", "tito"] = "step_wise"
+    """How Harbor rollouts become training rows: one row per turn, or one exact TITO row per trial."""
 
 
 @dataclass
@@ -54,9 +60,7 @@ class TTTConfig(GeneratorConfig):
     enable: bool = False
     budget_s: int = 1000
     sampler_type: str = "greedy"
-    sampler_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {"puct_c": 1.0}
-    )
+    sampler_kwargs: Dict[str, Any] = field(default_factory=lambda: {"puct_c": 1.0})
 
 
 @dataclass
@@ -106,9 +110,9 @@ class HarborExp(BasePPOExp):
             prompts_dataset = HarborTaskDataset(
                 data_files=self.cfg.data.train_data,
             )
-        assert (
-            len(prompts_dataset) >= self.cfg.trainer.train_batch_size
-        ), f"dataset should be atleast as large as `train_batch_size` {self.cfg.trainer.train_batch_size}, got size {len(prompts_dataset)}"
+        assert len(prompts_dataset) >= self.cfg.trainer.train_batch_size, (
+            f"dataset should be atleast as large as `train_batch_size` {self.cfg.trainer.train_batch_size}, got size {len(prompts_dataset)}"
+        )
         return prompts_dataset
 
     def get_eval_dataset(self):
@@ -163,15 +167,14 @@ def entropic_adv_estimator(
 
             centered = group_rewards - group_rewards.max()
             exponentials = torch.exp(beta * centered)
-            loo_normalizer = (
-                exponentials.sum() - exponentials
-            ) / (group_size - 1)
+            loo_normalizer = (exponentials.sum() - exponentials) / (group_size - 1)
             group_advantages = exponentials / (loo_normalizer + 1e-12) - 1.0
 
             advantages[position_tensor] = group_advantages
 
         advantages = advantages.unsqueeze(-1) * response_mask
     return advantages, advantages.clone()
+
 
 def entropic_adaptive_beta_adv_estimator(
     token_level_rewards: torch.Tensor,
@@ -232,9 +235,11 @@ def entropic_adaptive_beta_adv_estimator(
     return advantages, advantages.clone()
 
 
-
 AdvantageEstimatorRegistry.register("entropic", entropic_adv_estimator)
-AdvantageEstimatorRegistry.register("entropic_adaptive_beta", entropic_adaptive_beta_adv_estimator)
+AdvantageEstimatorRegistry.register(
+    "entropic_adaptive_beta", entropic_adaptive_beta_adv_estimator
+)
+
 
 @ray.remote(num_cpus=1)
 def skyrl_entrypoint(cfg):
