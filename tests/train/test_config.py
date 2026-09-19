@@ -384,6 +384,11 @@ def test_temperature_propagation():
     assert cfg.trainer.algorithm.temperature == 0.7
 
 
+def test_checkpoint_epoch_end_cli_override():
+    cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.ckpt_on_epoch_end=false"])
+    assert cfg.trainer.ckpt_on_epoch_end is False
+
+
 def test_cross_field_defaults():
     """Test that cross-field defaults are applied correctly."""
     cfg = SkyRLTrainConfig.from_cli_overrides(

@@ -468,7 +468,8 @@ class RayPPOTrainer:
                             is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0
                         )
                         ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
-                            is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+                            (self.cfg.trainer.ckpt_on_epoch_end and is_epoch_end)
+                            or self.global_step % self.cfg.trainer.ckpt_interval == 0
                         )
                         will_save_ckpts = force_save or ckpt_interval_save
                         if will_save_ckpts:

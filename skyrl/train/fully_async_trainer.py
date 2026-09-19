@@ -558,7 +558,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 )
                             # Save the end-of-epoch checkpoint the normal is_epoch_end path would have, since
                             # we break before reaching it.
-                            if self.cfg.trainer.ckpt_interval > 0:
+                            if (
+                                self.cfg.trainer.ckpt_interval > 0
+                                and self.cfg.trainer.ckpt_on_epoch_end
+                            ):
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                     await asyncio.to_thread(self.save_checkpoints)
                             if self.cfg.trainer.hf_save_interval > 0:
@@ -622,10 +625,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     self.tracker.log(self.all_metrics, step=self.global_step, commit=False)
                     self.all_metrics = {}
 
-                    # 7. Checkpointing. At interval and at the last step of each epoch.
+                    # 7. Checkpointing. At interval, and optionally at epoch end.
                     is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
                     if self.cfg.trainer.ckpt_interval > 0:
-                        if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
+                        if (
+                            self.cfg.trainer.ckpt_on_epoch_end and is_epoch_end
+                        ) or self.global_step % self.cfg.trainer.ckpt_interval == 0:
                             with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                 await asyncio.to_thread(self.save_checkpoints)
                     if self.cfg.trainer.hf_save_interval > 0:
