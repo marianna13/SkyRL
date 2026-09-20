@@ -4,6 +4,7 @@ import random
 import re
 import shutil
 import tempfile
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import List, Optional, Union
 
 import megatron.core.parallel_state as mpu
@@ -35,6 +36,9 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     offload_megatron_grads_to_cpu,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
+)
+from skyrl.backends.skyrl_train.distributed.megatron.optimizer_state import (
+    reuse_preinitialized_state_buffers,
 )
 from skyrl.backends.skyrl_train.distributed.strategy import DistributedStrategy
 from skyrl.backends.skyrl_train.distributed.utils import ModelOrModelOptimPair
@@ -139,6 +143,7 @@ def _patched_load_parameter_state_from_dp_reshardable(self, state_dict):
 # and get pickled into the "common" checkpoint file.  PyTorch 2.6+ defaults
 # torch.load to weights_only=True, which rejects these class globals.
 _safe_globals = [torch.optim.Adam, torch.optim.AdamW]
+_TE_FUSED_ADAM = None
 try:
     from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
         HybridDeviceOptimizer,
@@ -150,6 +155,7 @@ try:
     try:
         from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
 
+        _TE_FUSED_ADAM = FusedAdam
         _safe_globals.append(FusedAdam)
     except ImportError:
         pass
@@ -287,8 +293,47 @@ class MegatronStrategy(DistributedStrategy):
             init_fn = getattr(opt, "init_state_fn", None)
             inner_opt = getattr(opt, "optimizer", None)
             cfg = getattr(opt, "config", None)
-            if init_fn is not None and inner_opt is not None and cfg is not None and len(inner_opt.state) == 0:
+            if (
+                init_fn is not None
+                and inner_opt is not None
+                and cfg is not None
+                and len(inner_opt.state) == 0
+            ):
                 init_fn(inner_opt, cfg)
+
+    @contextmanager
+    def _memory_efficient_optimizer_checkpoint_load(self, optimizer):
+        """Avoid duplicate TE Adam buffers while building/loading a DCP template.
+
+        Megatron's load-time ``sharded_state_dict`` first creates dummy optimizer
+        tensors, then TE FusedAdam clears and reallocates them in
+        ``load_state_dict``.  Large models can fit one sharded Adam state but OOM
+        on that transient second copy.  Initialize once through Megatron's own
+        state factory and scope buffer reuse to the checkpoint load only.
+        """
+
+        optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
+        te_optimizers = []
+        if _TE_FUSED_ADAM is not None:
+            for opt in optimizers:
+                inner_opt = getattr(opt, "optimizer", None)
+                if isinstance(inner_opt, _TE_FUSED_ADAM):
+                    te_optimizers.append(inner_opt)
+
+        if not te_optimizers:
+            with nullcontext():
+                yield
+            return
+
+        self._ensure_optimizer_state_initialized(optimizer)
+        self.print(
+            "Reusing preinitialized Transformer Engine optimizer-state buffers "
+            f"for checkpoint load ({len(te_optimizers)} optimizer(s))."
+        )
+        with ExitStack() as stack:
+            for inner_opt in te_optimizers:
+                stack.enter_context(reuse_preinitialized_state_buffers(inner_opt))
+            yield
 
     def save_checkpoint(
         self,
@@ -450,55 +495,68 @@ class MegatronStrategy(DistributedStrategy):
         while hasattr(unwrapped_model, "module"):
             unwrapped_model = unwrapped_model.module
 
-        # Extract sharded state dicts.
-        sharded_state_dict = {}
-        model_sharded_state_dict = unwrapped_model.sharded_state_dict()
-        if not self.is_lora:
-            sharded_state_dict["model"] = model_sharded_state_dict
-        if optimizer and load_optimizer_states:
-            sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
-                model_sharded_state_dict,
-                is_loading=True,
-                metadata=self._dist_ckpt_optim_metadata,
-            )
-        if scheduler and load_lr_scheduler_states:
-            sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
+        optimizer_load_context = (
+            self._memory_efficient_optimizer_checkpoint_load(optimizer)
+            if optimizer and load_optimizer_states
+            else nullcontext()
+        )
+        with optimizer_load_context:
+            # Extract sharded state dicts. The optimizer context keeps TE's
+            # initialized moment buffers alive and reusable throughout both
+            # Megatron load_state_dict round trips.
+            sharded_state_dict = {}
+            model_sharded_state_dict = unwrapped_model.sharded_state_dict()
+            if not self.is_lora:
+                sharded_state_dict["model"] = model_sharded_state_dict
+            if optimizer and load_optimizer_states:
+                sharded_state_dict["optimizer"] = optimizer.sharded_state_dict(
+                    model_sharded_state_dict,
+                    is_loading=True,
+                    metadata=self._dist_ckpt_optim_metadata,
+                )
+            if scheduler and load_lr_scheduler_states:
+                sharded_state_dict["lr_scheduler"] = scheduler.state_dict()
 
-        if io.is_cloud_path(ckpt_dir):
-            state_dict = self._load_dist_checkpoint_from_cloud(ckpt_dir, sharded_state_dict)
-        else:
-            # Load from local filesystem with full parallel strategy.
-            load_strategy = get_default_load_sharded_strategy(ckpt_dir)
-            load_strategy = FullyParallelLoadStrategyWrapper(
-                load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
-            )
-            state_dict = dist_checkpointing.load(
-                sharded_state_dict=sharded_state_dict, checkpoint_dir=ckpt_dir, sharded_strategy=load_strategy
-            )
+            if io.is_cloud_path(ckpt_dir):
+                state_dict = self._load_dist_checkpoint_from_cloud(
+                    ckpt_dir, sharded_state_dict
+                )
+            else:
+                # Load from local filesystem with full parallel strategy.
+                load_strategy = get_default_load_sharded_strategy(ckpt_dir)
+                load_strategy = FullyParallelLoadStrategyWrapper(
+                    load_strategy,
+                    mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                state_dict = dist_checkpointing.load(
+                    sharded_state_dict=sharded_state_dict,
+                    checkpoint_dir=ckpt_dir,
+                    sharded_strategy=load_strategy,
+                )
 
-        if not self.is_lora:
-            # Load the model, optimizer, and scheduler state dicts.
-            assert (
-                "model" in state_dict
-            ), f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            model[0].load_state_dict(state_dict["model"], strict=load_module_strict)
-            self.print("Loaded model state dict.")
-        else:
-            self._load_lora_adapters(unwrapped_model, ckpt_dir)
+            if not self.is_lora:
+                # Load the model, optimizer, and scheduler state dicts.
+                assert "model" in state_dict, (
+                    f"Model state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                )
+                model[0].load_state_dict(state_dict["model"], strict=load_module_strict)
+                self.print("Loaded model state dict.")
+            else:
+                self._load_lora_adapters(unwrapped_model, ckpt_dir)
 
-        if optimizer and load_optimizer_states:
-            assert (
-                "optimizer" in state_dict
-            ), f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            optimizer.load_state_dict(state_dict["optimizer"])
-            self.print("Loaded optimizer state dict.")
+            if optimizer and load_optimizer_states:
+                assert "optimizer" in state_dict, (
+                    f"Optimizer state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                )
+                optimizer.load_state_dict(state_dict["optimizer"])
+                self.print("Loaded optimizer state dict.")
 
-        if scheduler and load_lr_scheduler_states:
-            assert (
-                "lr_scheduler" in state_dict
-            ), f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
-            scheduler.load_state_dict(state_dict["lr_scheduler"])
-            self.print("Loaded LR scheduler state dict.")
+            if scheduler and load_lr_scheduler_states:
+                assert "lr_scheduler" in state_dict, (
+                    f"LR scheduler state dict not found in checkpoint loaded from {ckpt_dir}. Available keys: {state_dict.keys()}"
+                )
+                scheduler.load_state_dict(state_dict["lr_scheduler"])
+                self.print("Loaded LR scheduler state dict.")
 
         # Load RNG state, if present.
         if "rng" in state_dict:
