@@ -297,6 +297,11 @@ class TTTHarborGenerator(GeneratorInterface):
         ] = f"{self.base_url}/v1"
 
         agent_kwargs = self._harbor_trial_config_template["agent"]["kwargs"]
+        # TTT can create thousands of Harbor trials in one run. These two
+        # terminal-debug artifacts are redundant with rollout details and grow
+        # linearly with the number of trials, so keep them opt-in for TTT.
+        agent_kwargs.setdefault("record_terminal_session", False)
+        agent_kwargs.setdefault("enable_pane_logging", False)
         if not agent_kwargs.get("collect_rollout_details", False):
             logger.warning(
                 "step_wise_trajectories requires collect_rollout_details; enabling it"
