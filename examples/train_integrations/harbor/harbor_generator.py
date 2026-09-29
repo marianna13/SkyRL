@@ -779,13 +779,21 @@ class HarborGenerator(GeneratorInterface):
         sampling_params = dict(input_batch.get("sampling_params") or {})
         batch_metadata = input_batch.get("batch_metadata")
 
+        # SkyRL SamplingParams uses max_generate_length; vLLM conversion uses max_tokens.
+        # Harbor must accept either key or the agent template's cap gets clobbered by a
+        # default of 1024 when only one of the two names is present.
+        _max_tokens = sampling_params.get("max_tokens")
+        if _max_tokens is None:
+            _max_tokens = sampling_params.get("max_generate_length")
+        sampling_params["max_tokens"] = _max_tokens
+
         logger.info(
             "Harbor sampling for {}: temperature={}, top_p={}, top_k={}, max_tokens={}",
             getattr(batch_metadata, "training_phase", "unknown"),
             sampling_params.get("temperature"),
             sampling_params.get("top_p"),
             sampling_params.get("top_k"),
-            sampling_params.get("max_tokens"),
+            _max_tokens,
         )
 
         if trajectory_ids is None:
@@ -882,8 +890,13 @@ class HarborGenerator(GeneratorInterface):
                             llm_kwargs[key] = sampling_params[key]
 
                     llm_call_kwargs = agent_kwargs.setdefault("llm_call_kwargs", {})
-                    if sampling_params.get("max_tokens") is not None:
-                        llm_call_kwargs["max_tokens"] = sampling_params["max_tokens"]
+                    # Prefer an explicit sampling max_tokens/max_generate_length; fall back
+                    # to the agent template's llm_call_kwargs.max_tokens if sampling omitted it.
+                    _call_max = sampling_params.get("max_tokens")
+                    if _call_max is None:
+                        _call_max = sampling_params.get("max_generate_length")
+                    if _call_max is not None and int(_call_max) > 0:
+                        llm_call_kwargs["max_tokens"] = int(_call_max)
 
                     # These vLLM-only controls are OpenAI-compatible extensions.
                     # LiteLLM forwards them in extra_body.
@@ -894,7 +907,12 @@ class HarborGenerator(GeneratorInterface):
                         "include_stop_str_in_output",
                     ):
                         if sampling_params.get(key) is not None:
-                            extra_body[key] = sampling_params[key]
+                            # Sampling params carry vLLM defaults (notably
+                            # skip_special_tokens=True). Keep an explicit
+                            # Harbor per-agent override authoritative so model
+                            # control tokens can survive into multi-turn
+                            # history when required by the chat template.
+                            extra_body.setdefault(key, sampling_params[key])
                 # Forward the salt via llm_kwargs.extra_body -> LiteLLM -> the vLLM request's top-level
                 # `cache_salt` field. vLLM rejects an empty salt, so attach only when set.
                 if cache_salt is not None:

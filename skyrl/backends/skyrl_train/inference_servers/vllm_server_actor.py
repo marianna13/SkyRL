@@ -542,6 +542,28 @@ async def _build_and_serve_vllm_server(
     # Initialize the engine (this loads the model - takes time)
     engine_args = AsyncEngineArgs.from_cli_args(cli_args)
 
+    # Register out-of-tree model architectures (e.g. GrugMoeForCausalLM) before
+    # ModelConfig validation. Must run in this process after vllm is importable.
+    try:
+        from grug_vllm_plugin.grugmoe_config import GrugMoeConfig
+        from transformers import AutoConfig
+
+        AutoConfig.register("grug_moe", GrugMoeConfig)
+        logger.info("AutoConfig.register('grug_moe', GrugMoeConfig) ok")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"grug_moe AutoConfig.register failed: {type(exc).__name__}: {exc}")
+        raise
+    try:
+        # Import the class eagerly so load errors surface here, not at inspect time.
+        from grug_vllm_plugin.grugmoe_model import GrugMoeForCausalLM
+        from vllm import ModelRegistry
+
+        ModelRegistry.register_model("GrugMoeForCausalLM", GrugMoeForCausalLM)
+        logger.info("ModelRegistry.register_model(GrugMoeForCausalLM) ok")
+    except Exception:
+        logger.exception("GrugMoe model class import/register failed")
+        raise
+
     stat_loggers = None
     if enable_ray_prometheus_stats:
         from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger

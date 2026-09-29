@@ -56,7 +56,11 @@ def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig])
     stop_val = sampling_params.stop
     vllm_sampling_params = {
         "min_tokens": 1,
-        "skip_special_tokens": True,
+        # GrugMoE / Snowball control tokens (`<|eot_id|>`, think markers, headers)
+        # must survive into multi-turn history. skip_special_tokens=True strips them
+        # from the decoded response and the model then re-reads unmarked prose
+        # (monorepo#41, issue 0036). additional_kwargs may override.
+        "skip_special_tokens": False,
         "include_stop_str_in_output": True,
         "max_tokens": sampling_params.max_generate_length,
         "temperature": sampling_params.temperature,
@@ -76,9 +80,9 @@ def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig])
                 vllm_sampling_params[key] = value
     else:
         if sampling_params.additional_kwargs is not None:
+            # additional_kwargs wins so callers can flip skip_special_tokens etc.
             for key, value in sampling_params.additional_kwargs.items():
-                if key not in vllm_sampling_params:
-                    vllm_sampling_params[key] = value
+                vllm_sampling_params[key] = value
     return vllm_sampling_params
 
 

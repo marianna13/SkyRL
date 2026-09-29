@@ -1,12 +1,16 @@
 from tempfile import TemporaryDirectory
 
+import pytest
 import torch
 
 from skyrl.models.grug import (
+    GRUG_VLLM_VERSION,
     GrugMoeConfig,
     grug_long_layer_flags,
     is_grug_router_bias,
     jax_top_k,
+    validate_grug_vllm_cache_window,
+    validate_grug_vllm_version,
 )
 
 
@@ -60,6 +64,23 @@ def test_snowball_normalizes_legacy_layer_types_for_vllm() -> None:
 
     assert config.grug_attention_layer_types == legacy_attention_pattern
     assert config.layer_types == ["attention"] * 26
+
+
+def test_grug_vllm_pin_and_cache_window_invariant() -> None:
+    config = snowball_config()
+
+    assert GRUG_VLLM_VERSION == "0.27.0"
+    validate_grug_vllm_version("0.27.0")
+    validate_grug_vllm_cache_window(config.grug_attention_layer_types, None)
+
+    with pytest.raises(RuntimeError, match="found vLLM==0.26.0"):
+        validate_grug_vllm_version("0.26.0")
+
+    with pytest.raises(RuntimeError, match="full-attention layers"):
+        validate_grug_vllm_cache_window(
+            config.grug_attention_layer_types,
+            config.sliding_window,
+        )
 
 
 def test_snowball_config_round_trip_preserves_vllm_attention_marker() -> None:

@@ -20,6 +20,7 @@ GRUG_ATTN_GATE_SCALE = 2.0
 GRUG_QK_RMS_NORM_EPS = 1e-6
 GRUG_XSA_EPS = 1e-6
 GRUG_ROUTER_RENORM_EPS = 1e-9
+GRUG_VLLM_VERSION = "0.27.0"
 
 
 def is_grug_router_bias(model_type: str | None, name: str) -> bool:
@@ -69,6 +70,45 @@ def grug_moe_layer_types(
         )
         for layer_index in range(num_layers)
     ]
+
+
+def validate_grug_vllm_cache_window(
+    attention_layer_types: list[str] | tuple[str, ...],
+    model_sliding_window: int | None,
+) -> None:
+    """Reject a model-level window that would truncate Grug global layers.
+
+    Grug passes its 2K window to each local attention layer. The vLLM cache
+    therefore has to remain globally unwindowed; otherwise an attention layer
+    whose per-layer window is ``None`` inherits the model-level window and is
+    silently reduced to local attention. This was the source of the severe
+    long-context quality regression tracked in issue #40.
+    """
+
+    full_attention_layers = [
+        index for index, layer_type in enumerate(attention_layer_types) if layer_type == "full_attention"
+    ]
+    if model_sliding_window is not None and full_attention_layers:
+        raise RuntimeError(
+            "GrugMoE requires CacheConfig.sliding_window=None so its "
+            f"full-attention layers {full_attention_layers} remain unwindowed; "
+            f"got model-level sliding_window={model_sliding_window}. This "
+            "runtime would silently apply the local window to global layers "
+            "and can severely degrade long-context task accuracy (issue #40)."
+        )
+
+
+def validate_grug_vllm_version(installed_version: str) -> None:
+    """Reject vLLM versions whose Grug compatibility has not been validated."""
+
+    if installed_version != GRUG_VLLM_VERSION:
+        raise RuntimeError(
+            "This GrugMoE integration is pinned to "
+            f"vLLM=={GRUG_VLLM_VERSION}; found vLLM=={installed_version}. "
+            "The sliding-window configuration API changed between vLLM 0.26 "
+            "and 0.27, and using an unvalidated version can silently truncate "
+            "Grug's global-attention layers (issue #40)."
+        )
 
 
 def grug_moe_rope_theta(config: Any) -> float:
@@ -304,6 +344,7 @@ __all__ = [
     "GRUG_ROUTER_BIAS_SUFFIX",
     "GRUG_ROUTER_RENORM_EPS",
     "GRUG_ROUTING_RENORM_SUM",
+    "GRUG_VLLM_VERSION",
     "GRUG_XSA_EPS",
     "GrugMoeConfig",
     "grug_long_layer_flags",
@@ -312,4 +353,6 @@ __all__ = [
     "grug_rms_norm_no_weight",
     "is_grug_router_bias",
     "jax_top_k",
+    "validate_grug_vllm_cache_window",
+    "validate_grug_vllm_version",
 ]

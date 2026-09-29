@@ -2,10 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
+# The vLLM version check intentionally runs before importing version-specific
+# vLLM APIs, so the remaining imports cannot all be at the top of the module.
+# ruff: noqa: E402, I001
+# flake8: noqa
+
 from collections.abc import Iterable
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
 from typing import Any
+
+from skyrl.models.grug import (
+    GRUG_VLLM_VERSION,
+    grug_moe_layer_types,
+    grug_moe_rope_theta,
+    validate_grug_vllm_cache_window,
+    validate_grug_vllm_version,
+)
+
+
+def _require_supported_vllm() -> None:
+    try:
+        installed_version = version("vllm")
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            f"GrugMoE requires vLLM=={GRUG_VLLM_VERSION}, but vLLM is not installed"
+        ) from exc
+    validate_grug_vllm_version(installed_version)
+
+
+_require_supported_vllm()
 
 import torch
 import torch.nn.functional as F
@@ -56,8 +83,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
-
-from skyrl.models.grug import grug_moe_layer_types, grug_moe_rope_theta
 
 logger = init_logger(__name__)
 
@@ -111,7 +136,7 @@ def _format_int_ranges(values: list[int]) -> str:
 
 
 def get_grug_moe_runtime_info(
-    _vllm_config: VllmConfig,
+    vllm_config: VllmConfig,
     model: nn.Module,
 ) -> dict[str, Any]:
     """Return worker-local GrugMoE runtime state for logs and diagnostics."""
@@ -151,6 +176,13 @@ def get_grug_moe_runtime_info(
         "expert_placement_strategy": str(moe_runner.expert_placement_strategy),
         "all2all_backend": str(moe_parallel_config.all2all_backend),
         "attention_backend": str(attention_backend),
+        "cache_sliding_window": vllm_config.cache_config.sliding_window,
+        "local_sliding_window": int(grug_model.config.sliding_window),
+        "global_attention_layers": [
+            index
+            for index, layer_type in enumerate(grug_model.config.attention_layer_types)
+            if layer_type == "full_attention"
+        ],
     }
 
 
@@ -163,7 +195,8 @@ def _log_grug_moe_runtime_info(
         "GrugMoE effective config: TP=%d/%d PP=%d/%d layers=[%d,%d) "
         "DP=%d/%d EP=%d/%d "
         "use_ep=%s experts=%d local=%d top_k=%d ownership=%s "
-        "placement=%s all2all=%s attention=%s",
+        "placement=%s all2all=%s attention=%s cache_window=%s "
+        "local_window=%d global_layers=%s",
         info["tp_rank"],
         info["tp_size"],
         info["pp_rank"],
@@ -182,6 +215,9 @@ def _log_grug_moe_runtime_info(
         info["expert_placement_strategy"],
         info["all2all_backend"],
         info["attention_backend"],
+        info["cache_sliding_window"],
+        info["local_sliding_window"],
+        info["global_attention_layers"],
     )
 
 
@@ -1061,6 +1097,10 @@ class GrugMoeModel(nn.Module):
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
+        validate_grug_vllm_cache_window(
+            self.config.attention_layer_types,
+            vllm_config.cache_config.sliding_window,
+        )
         if not self.config.disable_pko:
             raise NotImplementedError(
                 "GrugMoE does not support Partial Key Offset; export a checkpoint " "with disable_pko=true"
