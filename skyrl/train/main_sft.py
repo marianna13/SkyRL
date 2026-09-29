@@ -38,6 +38,21 @@ def sft_entrypoint(cfg: SFTConfig, skyrl_cfg: SkyRLTrainConfig):
     ``SFTTrainer`` selects its batch collator from ``use_sequence_packing``
     (controller-level FFD bin-packing, Megatron-only, when enabled).
     """
+    # GrugMoE is not an upstream transformers architecture, so `AutoConfig`
+    # does not know `model_type: grug_moe`. The Megatron worker registers it via
+    # `model_bridges` -> `grug_bridge`, but `SFTTrainer.setup()` calls
+    # `check_is_vlm` -> `AutoConfig.from_pretrained` *before* any worker exists,
+    # so the SFT path dies with `KeyError: 'grug_moe'` unless it is registered
+    # here, inside the Ray task. Same registration as `grug_vllm_plugin.py`.
+    try:
+        from transformers import AutoConfig
+
+        from skyrl.models.grug import GRUG_MOE_MODEL_TYPE, GrugMoeConfig
+
+        AutoConfig.register(GRUG_MOE_MODEL_TYPE, GrugMoeConfig, exist_ok=True)
+    except ImportError:
+        pass
+
     trainer = SFTTrainer(cfg, skyrl_cfg=skyrl_cfg)
     try:
         trainer.setup()
