@@ -496,11 +496,21 @@ def tokenize_chat_example(
     if not messages or messages[-1]["role"] != "assistant":
         return None
 
+    # Per-message train_loss (synthetic structural recovery): 0 = suppress loss
+    # on that assistant turn. Flags are positional and stripped before chat
+    # templates run so unknown keys never reach apply_chat_template.
+    train_flags = [1] * len(messages)
+    if any("train_loss" in m for m in messages):
+        train_flags = [0 if int(m.get("train_loss", 1)) == 0 else 1 for m in messages]
+        messages = [{k: v for k, v in m.items() if k != "train_loss"} for m in messages]
+
     messages = _normalize_chat_messages(messages)
 
     system_prompt = example.get(system_key) if system_key else None
-    if system_prompt and messages[0].get("role") != "system":
+    had_system = bool(messages) and messages[0].get("role") == "system"
+    if system_prompt and not had_system:
         messages = [{"role": "system", "content": system_prompt}] + messages
+        train_flags = [1] + train_flags
 
     # Per-row schemas yield to an explicit caller-provided ``tools`` kwarg.
     tools = _coerce_tools(example.get(tools_key)) if tools_key else None
@@ -519,12 +529,18 @@ def tokenize_chat_example(
         raise NotImplementedError("Training on all assistant messages with vision inputs is not yet supported")
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
+        # Last-assistant mode only trains the final turn; if that turn is flagged
+        # train_loss=0 (should not happen for recovery synth), skip the row.
+        if train_flags and train_flags[-1] == 0:
+            return None
         return _tokenize_chat_last_assistant(
             messages, tokenizer, max_length, processor if has_images else None, **tokenizer_kwargs
         )
     else:
         # ALL_ASSISTANT_MESSAGES
-        return _tokenize_chat_all_assistants(messages, tokenizer, max_length, **tokenizer_kwargs)
+        return _tokenize_chat_all_assistants(
+            messages, tokenizer, max_length, train_flags=train_flags, **tokenizer_kwargs
+        )
 
 
 def _unbatch(proc_tok_output):
@@ -627,6 +643,7 @@ def _tokenize_chat_all_assistants(
     messages: list[dict],
     tokenizer,
     max_length: Optional[int] = None,
+    train_flags: Optional[list[int]] = None,
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a conversation and compute loss on all assistant messages.
@@ -640,6 +657,9 @@ def _tokenize_chat_all_assistants(
             must contain at least one assistant message.
         tokenizer: HuggingFace tokenizer with ``apply_chat_template``.
         max_length: Optional sequence length cap; truncates to this limit.
+        train_flags: Optional per-message 0/1 aligned with ``messages``. 0
+            suppresses loss on that assistant turn (synthetic recovery malforms).
+            ``None`` = train every assistant turn.
         **tokenizer_kwargs: Extra kwargs forwarded to ``apply_chat_template``.
 
     Returns:
@@ -647,6 +667,12 @@ def _tokenize_chat_all_assistants(
         ``loss_mask`` (per-token 0/1 list within the action window), or
         ``None`` if no assistant tokens survived after truncation.
     """
+    if train_flags is None:
+        train_flags = [1] * len(messages)
+    elif len(train_flags) != len(messages):
+        raise ValueError(
+            f"train_flags length {len(train_flags)} != messages length {len(messages)}"
+        )
 
     # Find the index of the first assistant message.
     i = 0
@@ -668,7 +694,7 @@ def _tokenize_chat_all_assistants(
         return None
 
     later_token_ids, loss_mask, _ = get_response_ids_and_loss_mask_from_messages(
-        messages[i:], tokenizer, tokenizer_kwargs=tokenizer_kwargs
+        messages[i:], tokenizer, tokenizer_kwargs=tokenizer_kwargs, train_flags=train_flags[i:]
     )
     input_ids = initial_token_ids + later_token_ids
 

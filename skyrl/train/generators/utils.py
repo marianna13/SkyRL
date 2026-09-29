@@ -777,6 +777,7 @@ def get_response_ids_and_loss_mask_from_messages(
     tokenizer,
     assistant_logprobs=None,
     tokenizer_kwargs: Optional[dict] = None,
+    train_flags: Optional[List[int]] = None,
 ):
     """
     Get the response ids and loss mask from a list of messages.
@@ -792,11 +793,20 @@ def get_response_ids_and_loss_mask_from_messages(
                 `[[logprobs for assistant msg 1], [logprobs for assistant msg 2], ...]`.
         tokenizer_kwargs: Optional dict of extra kwargs forwarded to ``apply_chat_template``
                           (e.g. ``chat_template``, ``enable_thinking``). If None, uses defaults.
+        train_flags: Optional per-message 0/1 aligned with ``messages``. 0 forces loss_mask=0
+            for that assistant turn (used for synthetic structural-recovery malforms).
 
     Returns:
         Tuple[List[int], List[int], Optional[List[float]]]: response ids, loss mask, and rollout logprobs
     """
     assert len(messages), "messages list cannot be empty"
+    if train_flags is None:
+        train_flags = [
+            0 if int(message.get("train_loss", 1)) == 0 else 1
+            for message in messages
+        ]
+    elif len(train_flags) != len(messages):
+        raise ValueError(f"train_flags length {len(train_flags)} != messages length {len(messages)}")
 
     # Needed to correctly mask it zero for assistant messages.
     generation_prompt_ids = get_generation_prompt_ids(
@@ -812,6 +822,8 @@ def get_response_ids_and_loss_mask_from_messages(
     for i in range(len(messages)):
         # 2. Use fixed base approach to encode the message and accumulate
         cur_message = messages[i]
+        if "train_loss" in cur_message:
+            cur_message = {k: v for k, v in cur_message.items() if k != "train_loss"}
         cur_token_ids = encode_messages_subset(
             [cur_message], tokenizer, tokenizer_kwargs=tokenizer_kwargs
         )
@@ -820,6 +832,7 @@ def get_response_ids_and_loss_mask_from_messages(
         # 3. Set loss mask and rollout logprobs.
         # Regardless of the message role, each message is responsible for adding its own generation
         # prompt, and we apply the correct masking.
+        train_ok = int(train_flags[i]) != 0
         if cur_message["role"] in ("user", "tool"):
             # 3.1. For user / tool (observation) messages, it is simply zeros.
             # Tool turns carry environment output, never assistant generation.
@@ -870,7 +883,8 @@ def get_response_ids_and_loss_mask_from_messages(
                 rollout_logprobs.extend([0.0] * header_boundary)
 
             # 3.2.2. Add what the assistant actually generated
-            loss_mask.extend([1] * len(generated_token_ids))
+            # train_flags=0 suppresses synthetic malformed turns (recovery synth).
+            loss_mask.extend([1 if train_ok else 0] * len(generated_token_ids))
             if assistant_logprobs:
                 if assistant_msg_idx >= len(assistant_logprobs):
                     raise ValueError(

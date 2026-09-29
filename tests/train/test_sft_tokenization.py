@@ -11,7 +11,11 @@ import torch
 from transformers import AutoProcessor, AutoTokenizer
 
 from skyrl.train.config.sft_config import SFTConfig, TrainOnWhat
-from skyrl.train.generators.utils import get_generation_prompt_ids
+from skyrl.train.generators.utils import (
+    encode_messages_subset,
+    get_generation_prompt_ids,
+    get_response_ids_and_loss_mask_from_messages,
+)
 from skyrl.train.sft_trainer import (
     _normalize_chat_messages,
     collate_sft_batch,
@@ -535,6 +539,66 @@ def test_train_on_what_multi_turn_all_assistants(tokenizer):
             second_one_after_zero = i
     assert first_zero_after_one is not None, "Expected 0s between assistant turns"
     assert second_one_after_zero is not None, "Expected 1s for second assistant turn"
+
+
+def test_response_loss_mask_honors_embedded_train_loss(tokenizer):
+    """Embedded train_loss=0 keeps malformed assistant text as masked context."""
+    messages = [
+        {"role": "assistant", "content": "malformed tool call", "train_loss": 0},
+        {"role": "user", "content": "Fix the tool-call format."},
+        {"role": "assistant", "content": "corrected tool call", "train_loss": 1},
+    ]
+
+    response_ids, loss_mask, _ = get_response_ids_and_loss_mask_from_messages(
+        messages, tokenizer
+    )
+
+    malformed_ids = encode_messages_subset(
+        [{"role": "assistant", "content": "malformed tool call"}], tokenizer
+    )
+    assert len(response_ids) == len(loss_mask)
+    assert loss_mask[: len(malformed_ids)] == [0] * len(malformed_ids)
+    assert sum(loss_mask[len(malformed_ids) :]) > 0
+    assert "malformed tool call" in tokenizer.decode(response_ids)
+
+
+def test_train_on_what_all_assistants_honors_train_loss(tokenizer):
+    """SFT masks a synthetic malform while training on the recovery turn."""
+    messages = [
+        {"role": "user", "content": "Use the terminal."},
+        {"role": "assistant", "content": "malformed tool call", "train_loss": 0},
+        {"role": "user", "content": "Fix the tool-call format."},
+        {"role": "assistant", "content": "corrected tool call", "train_loss": 1},
+    ]
+    result = tokenize_chat_example(
+        {"messages": messages, "system": "Follow the tool schema."},
+        tokenizer,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert result is not None
+    malformed_ids = encode_messages_subset(
+        [{"role": "assistant", "content": "malformed tool call"}], tokenizer
+    )
+    assert result["loss_mask"][: len(malformed_ids)] == [0] * len(malformed_ids)
+    assert sum(result["loss_mask"][len(malformed_ids) :]) > 0
+    assert "malformed tool call" in tokenizer.decode(result["input_ids"])
+
+
+def test_train_on_what_last_assistant_skips_train_loss_zero(tokenizer):
+    """Last-assistant SFT drops a row whose only target is explicitly masked."""
+    result = tokenize_chat_example(
+        {
+            "messages": [
+                {"role": "user", "content": "Use the terminal."},
+                {"role": "assistant", "content": "malformed tool call", "train_loss": 0},
+            ]
+        },
+        tokenizer,
+        train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+    )
+
+    assert result is None
 
 
 def test_train_on_what_non_contiguous_assistants(tokenizer):
