@@ -802,7 +802,7 @@ def get_response_ids_and_loss_mask_from_messages(
     assert len(messages), "messages list cannot be empty"
     if train_flags is None:
         train_flags = [
-            0 if int(message.get("train_loss", 1)) == 0 else 1
+            0 if message.get("train_loss") is not None and int(message["train_loss"]) == 0 else 1
             for message in messages
         ]
     elif len(train_flags) != len(messages):

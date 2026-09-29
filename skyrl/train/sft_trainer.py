@@ -497,11 +497,13 @@ def tokenize_chat_example(
         return None
 
     # Per-message train_loss (synthetic structural recovery): 0 = suppress loss
-    # on that assistant turn. Flags are positional and stripped before chat
-    # templates run so unknown keys never reach apply_chat_template.
+    # on that assistant turn; None = train (pyarrow fills the key with null when
+    # parquet files with and without it are combined). Flags are positional and
+    # stripped before chat templates run so unknown keys never reach
+    # apply_chat_template.
     train_flags = [1] * len(messages)
     if any("train_loss" in m for m in messages):
-        train_flags = [0 if int(m.get("train_loss", 1)) == 0 else 1 for m in messages]
+        train_flags = [0 if m.get("train_loss") is not None and int(m["train_loss"]) == 0 else 1 for m in messages]
         messages = [{k: v for k, v in m.items() if k != "train_loss"} for m in messages]
 
     messages = _normalize_chat_messages(messages)
