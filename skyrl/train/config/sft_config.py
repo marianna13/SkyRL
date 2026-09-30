@@ -281,6 +281,19 @@ class SFTConfig(BaseConfig):
     train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_MESSAGE
     """Which tokens to compute loss on. See :class:`TrainOnWhat` for options."""
 
+    # ---- LM head / log-prob memory ----
+    fused_lm_head_logprob: bool = False
+    """Megatron only. Fuse the LM-head projection into the token log-prob so the
+    full ``[B, S, vocab//TP]`` logits tensor (and its float32 gradient) is never
+    materialized; logits are recomputed per ``logprobs_chunk_size`` chunk. Needed
+    for long contexts with a large vocab (e.g. Grug at 32k: ~30 GB of logits
+    otherwise). Maps to ``trainer.fused_lm_head_logprob``."""
+    fused_lm_head_logprob_backend: str = "torch"
+    """``"torch"`` or ``"triton"`` (falls back to torch if unavailable).
+    Maps to ``trainer.fused_lm_head_logprob_backend``."""
+    logprobs_chunk_size: Optional[int] = 1024
+    """Sequence chunk size for log-prob computation. Maps to ``trainer.logprobs_chunk_size``."""
+
     # ---- Packing ----
     remove_microbatch_padding: bool = True  # Pack multiple sequences per microbatch (requires flash_attn)
     use_sequence_packing: bool = False
@@ -669,6 +682,9 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     # to simplify user configuration
     cfg.trainer.micro_forward_batch_size_per_gpu = sft_cfg.micro_train_batch_size_per_gpu
     cfg.trainer.remove_microbatch_padding = sft_cfg.remove_microbatch_padding
+    cfg.trainer.fused_lm_head_logprob = sft_cfg.fused_lm_head_logprob
+    cfg.trainer.fused_lm_head_logprob_backend = sft_cfg.fused_lm_head_logprob_backend
+    cfg.trainer.logprobs_chunk_size = sft_cfg.logprobs_chunk_size
     # When sequence packing is on, each row in the dispatched batch is one bin
     # and one worker micro-batch, so the worker-side
     # ``micro_train_batch_size_per_gpu`` is 1 (the bin token budget is carried
