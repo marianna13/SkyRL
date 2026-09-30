@@ -194,7 +194,8 @@ class ConsoleLogger:
     @staticmethod
     def stringify_floats(obj: Any) -> Any:
         if isinstance(obj, float):
-            return f"{obj:.4f}"
+            # scientific notation for small values such as learning rates (1e-05 would print as 0.0000)
+            return f"{obj:.4e}" if obj != 0 and abs(obj) < 1e-3 else f"{obj:.4f}"
         elif isinstance(obj, dict):
             return {k: ConsoleLogger.stringify_floats(v) for k, v in obj.items()}
         elif isinstance(obj, list):

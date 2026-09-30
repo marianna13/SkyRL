@@ -1549,6 +1549,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # this already gets set in the init_model method
         pass
 
+    def set_num_training_steps(self, num_training_steps: int) -> None:
+        """Rebuild the LR scheduler for ``num_training_steps`` (SFT knows it only after building the
+        dataloader). Call before loading a checkpoint, which then restores the scheduler's position."""
+        if self.optimizer is None:
+            return
+        self.scheduler = get_megatron_optimizer_param_scheduler(
+            optimizer=self.optimizer,
+            config=self.cfg.policy.optimizer_config,
+            num_training_steps=num_training_steps,
+        )
+
     # ------------------------------------------------------------------
     # Multi-LoRA / AdapterStore Ray-callable methods
     # ------------------------------------------------------------------

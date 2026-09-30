@@ -1012,14 +1012,16 @@ class SFTTrainer:
                 if num_training_steps is None
                 else min(num_training_steps, self.sft_cfg.max_training_steps)
             )
-        # num_steps may be None when num_epochs is used; without an explicit cap,
-        # the worker will use its default large value for the LR scheduler.
+        # num_steps may be None when num_epochs is used: the worker then builds a
+        # placeholder LR scheduler, and train() rebuilds it once the dataloader
+        # fixes the step count (see _sync_num_training_steps).
         ray.get(
             actor_group.async_init_model(
                 self.sft_cfg.model.path,
                 num_training_steps=num_training_steps,
             )
         )
+        self._scheduler_num_training_steps = num_training_steps
         ray.get(actor_group.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
 
         self.dispatch = WorkerDispatch(self.cfg, policy_actor_group=actor_group)
@@ -1728,6 +1730,8 @@ class SFTTrainer:
             )
         with Timer("optim_step", timings):
             grad_norm = self.dispatch.optim_step("policy")
+        # LR the scheduler set for the next step, i.e. after this step's scheduler.step()
+        lr = self.dispatch.get_lr("policy")
 
         metrics = output.metrics
 
@@ -1739,6 +1743,7 @@ class SFTTrainer:
         return {
             "loss": loss_val,
             "grad_norm": grad_norm,
+            "lr": lr,
             "timings": timings,
         }
 
@@ -1838,6 +1843,7 @@ class SFTTrainer:
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
+                    "train/lr": step_result["lr"],
                     "train/tokens_per_second": tokens_per_second,
                     "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
                     "train/actual_num_tokens": actual_num_tokens,
@@ -1858,6 +1864,18 @@ class SFTTrainer:
                 self.dispatch.stop_profile("policy")
 
         logger.info("Dummy SFT training complete!")
+
+    def _sync_num_training_steps(self, num_steps: int) -> None:
+        """Rebuild the workers' LR scheduler if they were initialized with a different step count."""
+        if num_steps == self._scheduler_num_training_steps:
+            return
+        logger.info(
+            f"LR scheduler: rebuilding for {num_steps} training steps "
+            f"(scheduler={self.cfg.trainer.policy.optimizer_config.scheduler}, "
+            f"warmup={self.cfg.trainer.policy.optimizer_config.num_warmup_steps})"
+        )
+        self.dispatch.set_num_training_steps("policy", num_steps)
+        self._scheduler_num_training_steps = num_steps
 
     @staticmethod
     def _resolve_num_steps(
@@ -1943,6 +1961,11 @@ class SFTTrainer:
 
         if self.sft_cfg.max_training_steps is not None:
             logger.info(f"Capping training at max_training_steps={self.sft_cfg.max_training_steps}")
+
+        # Decaying LR schedules (cosine / linear) need the real step count, which
+        # with num_epochs is only known now. Rebuild before loading a checkpoint so
+        # the restored scheduler state lands on the final schedule.
+        self._sync_num_training_steps(num_steps)
 
         # Resume from checkpoint if configured. This also restores the train
         # dataloader's sampling position (when a data.pt is present), so the
@@ -2065,6 +2088,7 @@ class SFTTrainer:
                 log_dict = {
                     "train/loss": step_result["loss"],
                     "train/grad_norm": step_result["grad_norm"],
+                    "train/lr": step_result["lr"],
                     "train/tokens_per_second": tokens_per_second,
                     "train/tokens_per_second_per_gpu": tokens_per_second / self._num_training_gpus,
                     "train/actual_num_tokens": actual_num_tokens,

@@ -435,6 +435,20 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
 
+    def get_lr(self, model: str) -> Optional[float]:
+        """Current learning rate of the model's optimizer (rank 0; all ranks share the schedule)."""
+        return ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "get_lr"))[0]
+
+    def set_num_training_steps(self, model: str, num_training_steps: int) -> None:
+        """Rebuild the model's LR scheduler for ``num_training_steps`` (e.g. once SFT's dataloader
+        fixes the step count). Call before loading a checkpoint so its scheduler state is restored."""
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        ray.get(
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through", "set_num_training_steps", num_training_steps=num_training_steps
+            )
+        )
+
     def set_algorithm_config(self, model: str, **kwargs) -> None:
         """Update algorithm config fields on all workers for a model."""
         self._ensure_on_gpu(model, need_optimizer=False, need_model=False)

@@ -6,6 +6,7 @@ import ray
 import torch
 import torch.distributed
 from transformers import AutoConfig
+from transformers.trainer import get_scheduler
 
 try:
     # for torch 2.5+
@@ -323,6 +324,19 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
         self.model.model.config.pad_token_id = pad_token_id
+
+    def set_num_training_steps(self, num_training_steps: int) -> None:
+        """Rebuild the LR scheduler for ``num_training_steps`` (SFT knows it only after building the
+        dataloader). Call before loading a checkpoint, which then restores the scheduler's position."""
+        if self.optimizer is None:
+            return
+        optim_config = self.cfg.policy.optimizer_config
+        self.scheduler = get_scheduler(
+            optim_config.scheduler,
+            self.optimizer,
+            num_warmup_steps=optim_config.num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
 
     def forward(
         self,

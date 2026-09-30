@@ -16,9 +16,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Union
+from typing import Optional, Union
 
 import torch
+from loguru import logger
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer import (
     get_megatron_optimizer as get_megatron_optimizer_native,
@@ -66,25 +67,60 @@ def get_megatron_optimizer(
     )
 
 
+# transformers.SchedulerType name (OptimizerConfig.scheduler) -> Megatron OptimizerParamScheduler lr_decay_style
+_MEGATRON_LR_DECAY_STYLE = {
+    "constant_with_warmup": "constant",
+    "constant": "constant",
+    "cosine": "cosine",
+    "linear": "linear",
+}
+_UNKNOWN_NUM_TRAINING_STEPS = int(1e9)
+
+
 def get_megatron_optimizer_param_scheduler(
     optimizer,
     config: Union[SkyRLOptimizerConfig, DictConfig],
-    num_training_steps: int = 1e9,  # default to a large number for constant lr/wd
+    num_training_steps: Optional[int] = None,  # None (or the legacy 1e9 default) = not known yet
 ):
     """
     Get the optimizer parameter scheduler for Megatron.
+
+    ``config.scheduler`` follows the ``transformers.SchedulerType`` names used by the FSDP backend and maps
+    onto Megatron's ``lr_decay_style``: ``constant_with_warmup`` / ``constant`` -> constant, ``cosine`` ->
+    cosine and ``linear`` -> linear, each after ``num_warmup_steps`` of linear warmup. Decaying schedules
+    run from ``lr`` to ``min_lr`` over ``num_training_steps``.
+
+    ``num_training_steps=None`` means "not known yet" (SFT with ``num_epochs`` learns it only once the
+    dataloader exists): a decaying schedule then gets a constant placeholder, and the caller must rebuild
+    the scheduler with the real step count before training (``set_num_training_steps`` on the worker).
     """
-    # TODO: support other schedulers for Megatron
-    if getattr(config, "scheduler", "constant_with_warmup") != "constant_with_warmup":
-        raise ValueError("Only constant_with_warmup scheduler is supported for Megatron")
+    scheduler = getattr(config, "scheduler", "constant_with_warmup")
+    if scheduler not in _MEGATRON_LR_DECAY_STYLE:
+        raise ValueError(
+            f"Unsupported scheduler {scheduler!r} for Megatron; choose one of {sorted(_MEGATRON_LR_DECAY_STYLE)}"
+        )
+    lr_decay_style = _MEGATRON_LR_DECAY_STYLE[scheduler]
+    if num_training_steps is None or num_training_steps >= _UNKNOWN_NUM_TRAINING_STEPS:
+        if lr_decay_style != "constant":
+            logger.info(
+                f"scheduler={scheduler}: number of training steps not known yet, using a constant placeholder "
+                "until set_num_training_steps is called"
+            )
+        lr_decay_style = "constant"
+        num_training_steps = _UNKNOWN_NUM_TRAINING_STEPS
+    num_training_steps = int(num_training_steps)
 
     lr_warmup_steps = config.num_warmup_steps
-    if getattr(config, "lr_decay_steps", None) is None:
-        lr_decay_steps = num_training_steps
+    lr_decay_steps = getattr(config, "lr_decay_steps", None) or num_training_steps
     if getattr(config, "lr_warmup_steps_ratio", None) is not None and (
         getattr(config, "lr_warmup_steps", None) is None or getattr(config, "lr_warmup_steps", None) <= 0
     ):
         lr_warmup_steps = int(config.lr_warmup_steps_ratio * lr_decay_steps)
+    if lr_decay_style != "constant" and lr_warmup_steps >= lr_decay_steps:
+        raise ValueError(
+            f"num_warmup_steps ({lr_warmup_steps}) must be smaller than the number of training steps "
+            f"({lr_decay_steps}) for scheduler={scheduler}"
+        )
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
@@ -93,7 +129,7 @@ def get_megatron_optimizer_param_scheduler(
         min_lr=getattr(config, "min_lr", 0.0),
         lr_warmup_steps=lr_warmup_steps,
         lr_decay_steps=lr_decay_steps,
-        lr_decay_style="constant",
+        lr_decay_style=lr_decay_style,
         start_wd=config.weight_decay,
         end_wd=config.weight_decay,
         wd_incr_steps=num_training_steps,
