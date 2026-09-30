@@ -19,6 +19,11 @@ from ray.util.placement_group import (
     placement_group,
     placement_group_table,
 )
+from skyrl.train.config.query_bias import (
+    GrugQueryBiasUpdate,
+    GrugQueryBiasUpdateMode,
+    resolve_grug_query_bias_update,
+)
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -67,6 +72,17 @@ from skyrl.train.utils.utils import (
     get_ray_pg_ready_with_timeout,
     ray_noset_visible_devices,
 )
+from skyrl.models.grug_query_bias import (
+    GrugLossFreeBiasUpdater,
+    GrugQuantileBiasUpdater,
+    GrugQueryBiasCapturePlan,
+    GrugQueryBiasShardLayout,
+    GrugQueryBiasUpdater,
+    GrugQueryBiasWindow,
+)
+from skyrl.models.grug_moe import GrugMoeForCausalLM
+from skyrl.batch_invariant import enable_trainer_batch_invariance
+
 
 _SET_AFFINITY = False
 
@@ -75,6 +91,24 @@ if TYPE_CHECKING:
         RemoteInferenceClient,
     )
     from skyrl.train.config.config import InferenceEngineConfig
+
+
+
+def _grug_query_bias_updater(
+    model: GrugMoeForCausalLM,
+    valid_tokens: int,
+    update: GrugQueryBiasUpdate,
+) -> GrugQueryBiasUpdater:
+    if update.mode is GrugQueryBiasUpdateMode.LOSS_FREE:
+        assert update.update_rate is not None
+        return GrugLossFreeBiasUpdater(model, update_rate=update.update_rate)
+
+    target_weight = 1.0 if update.mode is GrugQueryBiasUpdateMode.REPLACE else update.interpolation_weight
+    assert target_weight is not None
+    return GrugQuantileBiasUpdater(model, valid_tokens, target_weight=target_weight)
+
+# Rigging's own shutdown waits two seconds; the extra covers the round trip to every rank.
+TELEMETRY_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 # Adapted from OpenRLHF: https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/trainer/ray/launcher.py#L17
@@ -838,6 +872,14 @@ class PolicyWorkerBase(Worker):
         self.record_memory: bool = False
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
+        self._grug_query_bias_window: GrugQueryBiasWindow | None = None
+
+
+    def _grug_causal_lm(self) -> GrugMoeForCausalLM | None:
+        """Return the local Grug CausalLM through the HF wrapper, if present."""
+
+        causal_lm = getattr(self.model, "model", self.model)
+        return causal_lm if isinstance(causal_lm, GrugMoeForCausalLM) else None
 
     def forward_backward(
         self,

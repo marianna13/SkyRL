@@ -105,3 +105,10 @@ instead of being redirected to the log file. Useful for debugging startup issues
 Default: False (infrastructure logs go to file only, stdout shows training progress).
 Set ``SKYRL_DUMP_INFRA_LOG_TO_STDOUT=1`` to show all logs on stdout.
 """
+
+
+VLLM_BATCH_INVARIANT_ENV = "VLLM_BATCH_INVARIANT"
+"""Name of vLLM's batch-invariance switch. ``trainer.algorithm.batch_invariant=true`` requires
+``VLLM_BATCH_INVARIANT=1`` in the trainer workers (``skyrl.batch_invariant``), matching MarinSkyRL's
+``marinskyrl.environment_contract``.
+"""
