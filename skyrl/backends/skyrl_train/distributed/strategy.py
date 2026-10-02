@@ -1,4 +1,6 @@
+import os
 import random
+import shutil
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, TypeVar, Union
 
@@ -11,9 +13,35 @@ from torch import distributed as dist
 from transformers import GenerationConfig, PretrainedConfig, PreTrainedTokenizer
 
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.models.grug import GRUG_MOE_MODEL_TYPE
 from skyrl.utils.tok import check_is_vlm, get_processor
 
 DataT = TypeVar("DataT", bound=Union[Dict[str, Any], torch.Tensor])
+
+
+def _verbatim_source_config(model_config: PretrainedConfig) -> Optional[str]:
+    """The source checkpoint's config.json, for models whose config must not be re-serialized.
+
+    GrugMoE: ``skyrl.models.grug.GrugMoeConfig`` rewrites ``layer_types`` to attention-only markers for vLLM 0.27,
+    and transformers >= 5 serializes those as ``full_attention`` for every layer. vLLM 0.26 plugins read
+    ``layer_types`` as the real sliding/full schedule (or refuse it), so an export written by ``save_pretrained``
+    either fails to load or would serve every layer as full attention. Training never changes the architecture,
+    so the source file is exact. None when the model is not Grug or the source file cannot be resolved.
+    """
+    if getattr(model_config, "model_type", None) != GRUG_MOE_MODEL_TYPE:
+        return None
+    source = getattr(model_config, "name_or_path", None) or getattr(model_config, "_name_or_path", None)
+    if not source:
+        return None
+    if os.path.isfile(os.path.join(source, "config.json")):
+        return os.path.join(source, "config.json")
+    try:
+        from transformers.utils import cached_file
+
+        return cached_file(source, "config.json")
+    except Exception as e:
+        logger.warning(f"Could not resolve the source config.json of '{source}' ({e}); re-serializing the config.")
+        return None
 
 
 class DistributedStrategy(ABC):
@@ -124,7 +152,11 @@ class DistributedStrategy(ABC):
         io.makedirs(hf_dir, exist_ok=True)
 
         with io.local_work_dir(hf_dir) as work_dir:
-            model_config.save_pretrained(work_dir)
+            source_config = _verbatim_source_config(model_config)
+            if source_config is not None:
+                shutil.copyfile(source_config, os.path.join(work_dir, "config.json"))
+            else:
+                model_config.save_pretrained(work_dir)
             if tokenizer:
                 tokenizer.save_pretrained(work_dir)
 
